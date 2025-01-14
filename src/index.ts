@@ -4,6 +4,7 @@
  */
 
 import serveImage from "./pixel";
+export { default as serveImage } from "./pixel";
 export * from "./types";
 
 export default serveImage;
