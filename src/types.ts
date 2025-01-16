@@ -14,11 +14,11 @@ export type ImageFormat =
 
 export type Options = {
   baseDir: string;
-  idHandler: (id: string) => string;
-  getUserFolder: (id: string, req: Request) => Promise<string>;
-  websiteURL: string;
-  apiRegex: RegExp;
-  allowedNetworkList: string[];
+  idHandler?: (id: string) => string;
+  getUserFolder?: (req: Request, id?: string | undefined) => Promise<string>;
+  websiteURL?: string;
+  apiRegex?: RegExp;
+  allowedNetworkList?: string[];
 };
 
 export type UserData = {

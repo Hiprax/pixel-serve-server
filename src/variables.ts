@@ -1,9 +1,11 @@
 import type { ImageFormat } from "./types";
 import { readFile } from "node:fs/promises";
 
-const NOT_FOUND_IMAGE = new URL("./assets/noimage.jpg", import.meta.url).href;
+const NOT_FOUND_IMAGE = new URL("./assets/noimage.jpg", import.meta.url)
+  .pathname;
 
-const NOT_FOUND_AVATAR = new URL("./assets/noavatar.png", import.meta.url).href;
+const NOT_FOUND_AVATAR = new URL("./assets/noavatar.png", import.meta.url)
+  .pathname;
 
 export const FALLBACKIMAGES = {
   normal: async () => readFile(NOT_FOUND_IMAGE),

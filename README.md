@@ -49,22 +49,27 @@ Here’s how to integrate the middleware with an Express application:
 
 ```typescript
 import express from "express";
-import serveImage from "pixel-serve-server";
+import { registerServe } from "pixel-serve-server";
+import path, { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-const options = {
-  baseDir: "/path/to/images", // Base directory for local images
+const BASE_IMAGE_DIR = path.join(__dirname, "../assets/images/public");
+const PRIVATE_IMAGE_DIR = path.join(__dirname, "../assets/images/private");
+
+const serveImage = registerServe({
+  baseDir: BASE_IMAGE_DIR, // Base directory for local images
   idHandler: (id: string) => `user-${id}`, // Custom handler for user IDs
   getUserFolder: async (id: string) => `/private/users/${id}`, // Logic for user-specific folder paths
   websiteURL: "example.com", // Your website's base URL
   apiRegex: /^\/api\/v1\//, // Regex for removing API prefixes
   allowedNetworkList: ["trusted.com"], // List of allowed network domains
-};
+});
 
-app.get("/api/v1/pixel/serve", (req, res, next) =>
-  serveImage(req, res, next, options)
-);
+app.get("/api/v1/pixel/serve", serveImage);
 
 app.listen(3000, () => {
   console.log("Server is running on http://localhost:3000");

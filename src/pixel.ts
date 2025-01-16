@@ -51,29 +51,33 @@ const serveImage = async (
       }
     }
 
-    if (userData.folder === "private" && parsedUserId) {
-      baseDir = await parsedOptions.getUserFolder(parsedUserId, req);
+    if (userData.folder === "private") {
+      const dir = await parsedOptions?.getUserFolder?.(req, parsedUserId);
+      if (dir) {
+        baseDir = dir;
+      }
     }
 
     const outputFormat = allowedFormats.includes(
-      userData.format.toLowerCase() as ImageFormat
+      userData?.format?.toLowerCase() as ImageFormat
     )
-      ? userData.format.toLowerCase()
+      ? userData?.format?.toLowerCase()
       : "jpeg";
 
     if (userData?.src?.startsWith("http")) {
       imageBuffer = await fetchImage(
-        userData.src,
+        userData?.src ?? "",
         baseDir,
-        parsedOptions.websiteURL,
-        userData.type as ImageType,
-        parsedOptions.apiRegex
+        parsedOptions?.websiteURL ?? "",
+        userData?.type as ImageType,
+        parsedOptions?.apiRegex,
+        parsedOptions?.allowedNetworkList
       );
     } else {
       imageBuffer = await readLocalImage(
         userData?.src ?? "",
         baseDir,
-        userData.type as ImageType
+        userData?.type as ImageType
       );
     }
 
@@ -90,13 +94,13 @@ const serveImage = async (
 
     const processedImage = await image
       .toFormat(outputFormat as keyof FormatEnum, {
-        quality: userData?.quality ? Number(userData.quality) : 80,
+        quality: userData?.quality ? Number(userData?.quality) : 80,
       })
       .toBuffer();
 
     const processedFileName = `${path.basename(
-      userData.src ?? "",
-      path.extname(userData.src ?? "")
+      userData?.src ?? "",
+      path.extname(userData?.src ?? "")
     )}.${outputFormat}`;
 
     res.type(mimeTypes[outputFormat]);
@@ -110,4 +114,15 @@ const serveImage = async (
   }
 };
 
-export default serveImage;
+/**
+ * @function registerServe
+ * @description A function to register the serveImage function as middleware for Express.
+ * @param {Options} options - The options object for image processing.
+ * @returns {function(Request, Response, NextFunction): Promise<void>} The middleware function.
+ */
+const registerServe = (options: Options) => {
+  return async (req: Request, res: Response, next: NextFunction) =>
+    serveImage(req, res, next, options);
+};
+
+export default registerServe;
