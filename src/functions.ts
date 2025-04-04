@@ -1,5 +1,4 @@
 import path from "node:path";
-import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import axios from "axios";
 import { mimeTypes, API_REGEX, FALLBACKIMAGES } from "./variables";
@@ -17,11 +16,38 @@ import type { ImageType } from "./types";
  * @param {string} specifiedPath - The path to check.
  * @returns {boolean} True if the path is valid, false otherwise.
  */
-const isValidPath = (basePath: string, specifiedPath: string): boolean => {
-  if (!basePath || !specifiedPath) return false;
-  const resolvedBase = path.resolve(basePath);
-  const resolvedPath = path.resolve(resolvedBase, specifiedPath);
-  return resolvedPath.startsWith(resolvedBase) && existsSync(resolvedPath);
+export const isValidPath = async (
+  basePath: string,
+  specifiedPath: string
+): Promise<boolean> => {
+  try {
+    if (!basePath || !specifiedPath) return false;
+    if (specifiedPath.includes("\0")) return false;
+    if (path.isAbsolute(specifiedPath)) return false;
+    if (!/^[^\x00-\x1F]+$/.test(specifiedPath)) return false;
+
+    const resolvedBase = path.resolve(basePath);
+    const resolvedPath = path.resolve(resolvedBase, specifiedPath);
+
+    const [realBase, realPath] = await Promise.all([
+      fs.realpath(resolvedBase),
+      fs.realpath(resolvedPath),
+    ]);
+
+    const baseStats = await fs.stat(realBase);
+    if (!baseStats.isDirectory()) return false;
+
+    const normalizedBase = realBase + path.sep;
+    const normalizedPath = realPath + path.sep;
+
+    const isInside =
+      normalizedPath.startsWith(normalizedBase) || realPath === realBase;
+
+    const relative = path.relative(realBase, realPath);
+    return !relative.startsWith("..") && !path.isAbsolute(relative) && isInside;
+  } catch {
+    return false;
+  }
 };
 
 /**
@@ -66,7 +92,8 @@ export const readLocalImage = async (
   baseDir: string,
   type: ImageType = "normal"
 ) => {
-  if (!isValidPath(baseDir, filePath)) {
+  const isValid = await isValidPath(baseDir, filePath);
+  if (!isValid) {
     return await FALLBACKIMAGES[type]();
   }
   try {

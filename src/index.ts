@@ -5,3 +5,4 @@
 
 export { default as registerServe } from "./pixel";
 export * from "./types";
+export { isValidPath } from "./functions";
