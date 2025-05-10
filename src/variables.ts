@@ -1,11 +1,16 @@
 import type { ImageFormat } from "./types";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const NOT_FOUND_IMAGE = new URL("./assets/noimage.jpg", import.meta.url)
-  .pathname;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const NOT_FOUND_AVATAR = new URL("./assets/noavatar.png", import.meta.url)
-  .pathname;
+const getAssetPath = (filename: string) => {
+  return path.join(__dirname, "assets", filename);
+};
+
+const NOT_FOUND_IMAGE = getAssetPath("noimage.jpg");
+const NOT_FOUND_AVATAR = getAssetPath("noavatar.png");
 
 export const FALLBACKIMAGES = {
   normal: async () => readFile(NOT_FOUND_IMAGE),
