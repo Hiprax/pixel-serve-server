@@ -5,4 +5,5 @@
 
 export { default as registerServe } from "./pixel";
 export * from "./types";
+export { optionsSchema, userDataSchema } from "./schema";
 export { isValidPath } from "./functions";

@@ -1,5 +1,6 @@
-import { API_REGEX } from "./variables";
-import type { Options, UserData } from "./types";
+import { optionsSchema, userDataSchema } from "./schema";
+import type { ParsedOptions, ParsedUserData } from "./schema";
+import type { PixelServeOptions, UserData } from "./types";
 
 /**
  * @typedef {("avatar" | "normal")} ImageType
@@ -39,20 +40,8 @@ import type { Options, UserData } from "./types";
  * @param {Partial<Options>} options - The user-provided options.
  * @returns {Options} The rendered options object.
  */
-export const renderOptions = (options: Partial<Options>): Options => {
-  const initialOptions: Options = {
-    baseDir: "",
-    idHandler: (id: string) => id,
-    getUserFolder: async () => "",
-    websiteURL: "",
-    apiRegex: API_REGEX,
-    allowedNetworkList: [],
-  };
-  return {
-    ...initialOptions,
-    ...options,
-  };
-};
+export const renderOptions = (options: PixelServeOptions): ParsedOptions =>
+  optionsSchema.parse(options);
 
 /**
  * Renders the user data object with default values and user-provided values.
@@ -60,28 +49,28 @@ export const renderOptions = (options: Partial<Options>): Options => {
  * @param {Partial<UserData>} userData - The user-provided data.
  * @returns {UserData} The rendered user data object.
  */
-export const renderUserData = (userData: Partial<UserData>): UserData => {
-  const initialUserData: UserData = {
-    quality: 80,
-    format: "jpeg",
-    src: "/placeholder/noimage.jpg",
-    folder: "public",
-    type: "normal",
-    width: undefined,
-    height: undefined,
-    userId: undefined,
+export const renderUserData = (
+  userData: Partial<UserData>,
+  bounds: {
+    minWidth: number;
+    maxWidth: number;
+    minHeight: number;
+    maxHeight: number;
+    defaultQuality: number;
+  }
+): ParsedUserData => {
+  const parsed = userDataSchema.parse(userData);
+
+  const clamp = (value: number | undefined, min: number, max: number) => {
+    if (value === undefined) return undefined;
+    return Math.min(Math.max(value, min), max);
   };
+
   return {
-    ...initialUserData,
-    ...userData,
-    quality: userData.quality
-      ? Math.min(Math.max(Number(userData.quality) || 80, 1), 100)
-      : 100,
-    width: userData.width
-      ? Math.min(Math.max(Number(userData.width), 50), 2000)
-      : undefined,
-    height: userData.height
-      ? Math.min(Math.max(Number(userData.height), 50), 2000)
-      : undefined,
+    ...parsed,
+    width: clamp(parsed.width, bounds.minWidth, bounds.maxWidth),
+    height: clamp(parsed.height, bounds.minHeight, bounds.maxHeight),
+    quality: parsed.quality ?? bounds.defaultQuality,
+    format: parsed.format ?? "jpeg",
   };
 };

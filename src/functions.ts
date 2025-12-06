@@ -1,7 +1,7 @@
 import path from "node:path";
 import * as fs from "node:fs/promises";
 import axios from "axios";
-import { mimeTypes, API_REGEX, FALLBACKIMAGES } from "./variables";
+import { FALLBACKIMAGES, mimeTypes } from "./variables";
 import type { ImageType } from "./types";
 
 /**
@@ -14,7 +14,7 @@ import type { ImageType } from "./types";
  *
  * @param {string} basePath - The base directory to resolve paths.
  * @param {string} specifiedPath - The path to check.
- * @returns {boolean} True if the path is valid, false otherwise.
+ * @returns {Promise<boolean>} True if the path is valid, false otherwise.
  */
 export const isValidPath = async (
   basePath: string,
@@ -59,12 +59,22 @@ export const isValidPath = async (
  */
 const fetchFromNetwork = async (
   src: string,
-  type: ImageType = "normal"
+  type: ImageType = "normal",
+  {
+    timeoutMs,
+    maxBytes,
+  }: {
+    timeoutMs: number;
+    maxBytes: number;
+  }
 ): Promise<Buffer> => {
   try {
     const response = await axios.get(src, {
       responseType: "arraybuffer",
-      timeout: 5000,
+      timeout: timeoutMs,
+      maxContentLength: maxBytes,
+      maxBodyLength: maxBytes,
+      validateStatus: (status) => status >= 200 && status < 300,
     });
 
     const contentType = response.headers["content-type"]?.toLowerCase();
@@ -110,28 +120,44 @@ export const readLocalImage = async (
  * @param {string} baseDir - Base directory to resolve local paths.
  * @param {string} websiteURL - The URL of the website.
  * @param {ImageType} [type="normal"] - Type of fallback image if the path is invalid.
- * @param {RegExp} [apiRegex=API_REGEX] - Regular expression to match API routes.
  * @param {string[]} [allowedNetworkList=[]] - List of allowed network hosts.
  * @returns {Promise<Buffer>} A buffer containing the image data or a fallback image.
  */
 export const fetchImage = (
   src: string,
   baseDir: string,
-  websiteURL: string,
+  websiteURL: string | undefined,
   type: ImageType = "normal",
-  apiRegex: RegExp = API_REGEX,
-  allowedNetworkList: string[] = []
-) => {
-  const url = new URL(src);
-  const isInternal = [websiteURL, `www.${websiteURL}`].includes(url.host);
-  if (isInternal) {
-    const localPath = url.pathname.replace(apiRegex, "");
-    return readLocalImage(localPath, baseDir, type);
-  } else {
+  apiRegex: RegExp,
+  allowedNetworkList: string[] = [],
+  {
+    timeoutMs,
+    maxBytes,
+  }: {
+    timeoutMs: number;
+    maxBytes: number;
+  }
+): Promise<Buffer> => {
+  try {
+    const url = new URL(src);
+    const isInternal =
+      websiteURL !== undefined &&
+      [websiteURL, `www.${websiteURL}`].includes(url.host);
+
+    if (isInternal) {
+      const localPath = url.pathname.replace(apiRegex, "");
+      return readLocalImage(localPath, baseDir, type);
+    }
+
     const allowedCondition = allowedNetworkList.includes(url.host);
     if (!allowedCondition) {
       return FALLBACKIMAGES[type]();
     }
-    return fetchFromNetwork(src, type);
+    if (!["http:", "https:"].includes(url.protocol)) {
+      return FALLBACKIMAGES[type]();
+    }
+    return fetchFromNetwork(src, type, { timeoutMs, maxBytes });
+  } catch {
+    return readLocalImage(src, baseDir, type);
   }
 };

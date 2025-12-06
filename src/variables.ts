@@ -3,18 +3,25 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * Get the directory path for the current module.
+ * Uses import.meta.url for ESM (tsup provides shims for CJS compatibility).
+ */
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
-const getAssetPath = (filename: string) => {
-  return path.join(__dirname, "assets", filename);
+const getAssetPath = (filename: string): string => {
+  return path.join(moduleDir, "assets", filename);
 };
 
 const NOT_FOUND_IMAGE = getAssetPath("noimage.jpg");
 const NOT_FOUND_AVATAR = getAssetPath("noavatar.png");
 
-export const FALLBACKIMAGES = {
-  normal: async () => readFile(NOT_FOUND_IMAGE),
-  avatar: async () => readFile(NOT_FOUND_AVATAR),
+export const FALLBACKIMAGES: Record<
+  "normal" | "avatar",
+  () => Promise<Buffer>
+> = {
+  normal: async (): Promise<Buffer> => readFile(NOT_FOUND_IMAGE),
+  avatar: async (): Promise<Buffer> => readFile(NOT_FOUND_AVATAR),
 };
 
 export const API_REGEX: RegExp = /^\/api\/v1\//;

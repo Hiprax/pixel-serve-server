@@ -1,12 +1,26 @@
 {
   "name": "pixel-serve-server",
-  "version": "0.0.7",
+  "version": "1.0.0",
   "description": "A robust Node.js utility for handling and processing images. This package provides features like resizing, format conversion and etc.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./assets/*": "./dist/assets/*",
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
   "scripts": {
-    "build": "tsup"
+    "build": "tsup",
+    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "format": "prettier --check \"src/**/*.{ts,tsx}\"",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest watch"
   },
   "files": [
     "dist",
@@ -31,18 +45,28 @@
     "url": "https://github.com/Hiprax/pixel-serve-server/issues"
   },
   "homepage": "https://github.com/Hiprax/pixel-serve-server#readme",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "express": "^5.2.1",
+    "sharp": "^0.34.5",
+    "zod": "^4.1.13"
+  },
   "devDependencies": {
-    "@types/express": "^5.0.0",
-    "@types/node": "^22.10.5",
-    "tsup": "^8.3.5",
-    "typescript": "^5.7.3"
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.1",
+    "@types/supertest": "^6.0.3",
+    "@typescript-eslint/eslint-plugin": "^8.48.1",
+    "@typescript-eslint/parser": "^8.48.1",
+    "@vitest/coverage-v8": "^4.0.15",
+    "eslint": "^9.39.1",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.7.4",
+    "supertest": "^7.1.4",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.15"
   },
   "engines": {
-    "node": ">=8.x"
-  },
-  "dependencies": {
-    "axios": "^1.7.9",
-    "express": "^4.21.2",
-    "sharp": "^0.33.5"
+    "node": ">=18"
   }
 }

@@ -12,20 +12,29 @@ export type ImageFormat =
   | "avif"
   | "svg";
 
-export type Options = {
+export type PixelServeOptions = {
   baseDir: string;
   idHandler?: (id: string) => string;
-  getUserFolder?: (req: Request, id?: string | undefined) => Promise<string>;
+  getUserFolder?: (req: Request, id?: string) => Promise<string> | string;
   websiteURL?: string;
   apiRegex?: RegExp;
   allowedNetworkList?: string[];
+  cacheControl?: string;
+  etag?: boolean;
+  minWidth?: number;
+  maxWidth?: number;
+  minHeight?: number;
+  maxHeight?: number;
+  defaultQuality?: number;
+  requestTimeoutMs?: number;
+  maxDownloadBytes?: number;
 };
 
 export type UserData = {
-  quality: number | string;
-  format: ImageFormat;
-  src?: string;
-  folder?: string;
+  src: string;
+  quality?: number | string;
+  format?: ImageFormat;
+  folder?: "public" | "private";
   type?: ImageType;
   userId?: string;
   width?: number | string;

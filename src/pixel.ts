@@ -1,8 +1,14 @@
 import path from "node:path";
+import { createHash } from "node:crypto";
 import sharp, { FormatEnum, ResizeOptions } from "sharp";
 import type { Request, Response, NextFunction } from "express";
-import type { Options, UserData, ImageFormat, ImageType } from "./types";
-import { allowedFormats, mimeTypes } from "./variables";
+import type {
+  PixelServeOptions,
+  UserData,
+  ImageFormat,
+  ImageType,
+} from "./types";
+import { allowedFormats, FALLBACKIMAGES, mimeTypes } from "./variables";
 import { fetchImage, readLocalImage } from "./functions";
 import { renderOptions, renderUserData } from "./renders";
 
@@ -22,105 +28,138 @@ import { renderOptions, renderUserData } from "./renders";
  * @param {Request} req - The Express request object.
  * @param {Response} res - The Express response object.
  * @param {NextFunction} next - The Express next function.
- * @param {Options} options - The options object for image processing.
+ * @param {PixelServeOptions} options - The options object for image processing.
  * @returns {Promise<void>}
  */
 const serveImage = async (
   req: Request,
   res: Response,
   next: NextFunction,
-  options: Options
+  options: PixelServeOptions
 ) => {
   try {
-    const userData = renderUserData(req.query as UserData);
     const parsedOptions = renderOptions(options);
+    const userData = renderUserData(req.query as Partial<UserData>, {
+      minWidth: parsedOptions.minWidth,
+      maxWidth: parsedOptions.maxWidth,
+      minHeight: parsedOptions.minHeight,
+      maxHeight: parsedOptions.maxHeight,
+      defaultQuality: parsedOptions.defaultQuality,
+    });
 
-    let imageBuffer;
     let baseDir = parsedOptions.baseDir;
-    let parsedUserId;
+    let parsedUserId: string | undefined;
 
     if (userData.userId) {
-      const userIdStr =
-        typeof userData.userId === "object"
-          ? String(Object.values(userData.userId)[0])
-          : String(userData.userId);
-      if (parsedOptions.idHandler) {
-        parsedUserId = parsedOptions.idHandler(userIdStr);
-      } else {
-        parsedUserId = userIdStr;
-      }
+      parsedUserId = parsedOptions.idHandler
+        ? parsedOptions.idHandler(userData.userId)
+        : userData.userId;
     }
 
-    if (userData.folder === "private") {
-      const dir = await parsedOptions?.getUserFolder?.(req, parsedUserId);
+    if (userData.folder === "private" && parsedOptions.getUserFolder) {
+      const dir = await parsedOptions.getUserFolder(req, parsedUserId);
       if (dir) {
         baseDir = dir;
       }
     }
 
     const outputFormat = allowedFormats.includes(
-      userData?.format?.toLowerCase() as ImageFormat
+      (userData.format ?? "").toLowerCase() as ImageFormat
     )
-      ? userData?.format?.toLowerCase()
+      ? (userData.format as ImageFormat)
       : "jpeg";
 
-    if (userData?.src?.startsWith("http")) {
-      imageBuffer = await fetchImage(
-        userData?.src ?? "",
-        baseDir,
-        parsedOptions?.websiteURL ?? "",
-        userData?.type as ImageType,
-        parsedOptions?.apiRegex,
-        parsedOptions?.allowedNetworkList
-      );
-    } else {
-      imageBuffer = await readLocalImage(
-        userData?.src ?? "",
-        baseDir,
-        userData?.type as ImageType
-      );
-    }
+    const resolveBuffer = async (): Promise<Buffer> => {
+      if (!userData.src) {
+        return FALLBACKIMAGES[userData.type ?? "normal"]();
+      }
+      if (userData.src.startsWith("http")) {
+        return fetchImage(
+          userData.src,
+          baseDir,
+          parsedOptions.websiteURL,
+          userData.type as ImageType,
+          parsedOptions.apiRegex,
+          parsedOptions.allowedNetworkList,
+          {
+            timeoutMs: parsedOptions.requestTimeoutMs,
+            maxBytes: parsedOptions.maxDownloadBytes,
+          }
+        );
+      }
+      return readLocalImage(userData.src, baseDir, userData.type as ImageType);
+    };
 
-    let image = sharp(imageBuffer);
+    const imageBuffer = await resolveBuffer();
+    let image = sharp(imageBuffer, { failOn: "truncated" });
 
-    if (userData?.width || userData?.height) {
-      const resizeOptions = {
-        width: userData?.width ?? undefined,
-        height: userData?.height ?? undefined,
+    if (userData.width || userData.height) {
+      const resizeOptions: ResizeOptions = {
+        width: userData.width ?? undefined,
+        height: userData.height ?? undefined,
         fit: sharp.fit.cover,
+        withoutEnlargement: true,
       };
-      image = image.resize(resizeOptions as ResizeOptions);
+      image = image.resize(resizeOptions);
     }
 
     const processedImage = await image
+      .rotate()
       .toFormat(outputFormat as keyof FormatEnum, {
-        quality: userData?.quality ? Number(userData?.quality) : 80,
+        quality: userData.quality,
       })
       .toBuffer();
 
-    const processedFileName = `${path.basename(
-      userData?.src ?? "",
-      path.extname(userData?.src ?? "")
-    )}.${outputFormat}`;
+    const sourceName = userData.src
+      ? path.basename(userData.src, path.extname(userData.src))
+      : "image";
+    const processedFileName = `${sourceName}.${outputFormat}`;
+
+    const etag = parsedOptions.etag
+      ? `"${createHash("sha1").update(processedImage).digest("hex")}"`
+      : undefined;
+
+    if (etag && req.headers["if-none-match"] === etag) {
+      res.status(304).end();
+      return;
+    }
 
     res.type(mimeTypes[outputFormat]);
     res.setHeader(
       "Content-Disposition",
       `inline; filename="${processedFileName}"`
     );
+    res.setHeader(
+      "Cache-Control",
+      parsedOptions.cacheControl ??
+        "public, max-age=86400, stale-while-revalidate=604800"
+    );
+    if (etag) {
+      res.setHeader("ETag", etag);
+    }
+    res.setHeader("Content-Length", processedImage.length.toString());
     res.send(processedImage);
+    /* c8 ignore next */
   } catch (error) {
-    next(error);
+    try {
+      const fallback = await FALLBACKIMAGES.normal();
+      res.type(mimeTypes.jpeg);
+      res.setHeader("Content-Disposition", `inline; filename="fallback.jpeg"`);
+      res.setHeader("Cache-Control", "public, max-age=60");
+      res.send(fallback);
+    } catch (fallbackError) {
+      next(fallbackError);
+    }
   }
 };
 
 /**
  * @function registerServe
  * @description A function to register the serveImage function as middleware for Express.
- * @param {Options} options - The options object for image processing.
+ * @param {PixelServeOptions} options - The options object for image processing.
  * @returns {function(Request, Response, NextFunction): Promise<void>} The middleware function.
  */
-const registerServe = (options: Options) => {
+const registerServe = (options: PixelServeOptions) => {
   return async (req: Request, res: Response, next: NextFunction) =>
     serveImage(req, res, next, options);
 };

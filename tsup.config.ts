@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { defineConfig } from "tsup";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,7 +10,11 @@ export default defineConfig({
   clean: true,
   minify: true,
   sourcemap: true,
+  treeshake: true,
+  target: "es2022",
+  platform: "node",
   shims: true,
+  splitting: false,
   async onSuccess() {
     await mkdir("dist/assets", { recursive: true });
 
