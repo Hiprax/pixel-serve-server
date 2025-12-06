@@ -1,6 +1,10 @@
 # Pixel Serve Server
 
-A modern, type-safe middleware for processing, resizing, and serving images in Node.js applications. Built with **TypeScript**, powered by **Sharp**, and designed for secure production use with ESM & CJS bundles.
+**A modern, type-safe middleware** for processing, resizing, and serving images in Node.js applications. Built with **TypeScript**, powered by **Sharp**, and designed for secure production use with ESM & CJS bundles.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9.3-blue.svg)](https://www.typescriptlang.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-18+-blue.svg)](https://nodejs.org/)
 
 ## Features
 
@@ -15,10 +19,6 @@ A modern, type-safe middleware for processing, resizing, and serving images in N
 
 ```bash
 npm install pixel-serve-server
-# or
-yarn add pixel-serve-server
-# or
-pnpm add pixel-serve-server
 ```
 
 ## Quick Start
