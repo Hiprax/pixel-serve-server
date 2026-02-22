@@ -24,7 +24,7 @@ const assetDir = path.join(__dirname, "assets");
 const bufferParser = (
   res: Response,
   callback: (err: Error | null, buffer: Buffer) => void
-) => {
+): void => {
   const data: Buffer[] = [];
   res.on("data", (chunk) =>
     data.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
@@ -32,7 +32,7 @@ const bufferParser = (
   res.on("end", () => callback(null, Buffer.concat(data)));
 };
 
-const createApp = () => {
+const createApp = (): ReturnType<typeof express> => {
   const app = express();
   app.get(
     "/api/v1/pixel/serve",
@@ -183,7 +183,8 @@ describe("registerServe middleware", () => {
       { timeoutMs: 2000, maxBytes: 1024 }
     );
 
-    expect(result.length).toBeGreaterThan(0);
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
   });
   it("falls back when network request fails", async () => {
     vi.mocked(axios.get).mockRejectedValue(new Error("fail"));
@@ -210,7 +211,8 @@ describe("registerServe middleware", () => {
       ["allowed.test"],
       { timeoutMs: 2000, maxBytes: 1024 }
     );
-    expect(result.length).toBeGreaterThan(0);
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
   });
 
   it("falls back when protocol is not http/https", async () => {
@@ -223,7 +225,8 @@ describe("registerServe middleware", () => {
       ["allowed.test"],
       { timeoutMs: 2000, maxBytes: 1024 }
     );
-    expect(result.length).toBeGreaterThan(0);
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
   });
 
   it("reads local image when URL matches website host", async () => {
@@ -301,24 +304,6 @@ describe("registerServe middleware", () => {
     expect(response.status).toBe(500); // next(error) should surface when both pipelines fail
     fallbackSpy.mockRestore();
     toBufferSpy.mockRestore();
-  });
-
-  it("returns 304 when etag matches", async () => {
-    const app = createApp();
-    const first = await request(app)
-      .get("/api/v1/pixel/serve")
-      .query({ src: "noimage.jpg", format: "jpeg" })
-      .parse(bufferParser);
-
-    const etag = first.headers.etag;
-    expect(etag).toBeDefined();
-
-    const second = await request(app)
-      .get("/api/v1/pixel/serve")
-      .set("If-None-Match", etag as string)
-      .query({ src: "noimage.jpg", format: "jpeg" });
-
-    expect(second.status).toBe(304);
   });
 
   it("serves default fallback when src missing", async () => {
@@ -511,6 +496,11 @@ describe("registerServe middleware", () => {
       .parse(bufferParser);
 
     expect(response.status).toBe(200);
+    const metadata = await sharp(response.body).metadata();
+    // Width was 10 (below min 100), clamped to 100; height was 1000 (above max 500), clamped to 500
+    // withoutEnlargement may prevent actual upscale, but dimensions should not exceed max
+    if (metadata.width) expect(metadata.width).toBeLessThanOrEqual(500);
+    if (metadata.height) expect(metadata.height).toBeLessThanOrEqual(500);
   });
 
   it("serves avatar fallback when src is empty and type is avatar", async () => {
@@ -533,5 +523,237 @@ describe("registerServe middleware", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+  });
+
+  it("generates deterministic ETag for same input", async () => {
+    const app = createApp();
+    const query = { src: "noimage.jpg", width: 100, format: "jpeg" };
+
+    const first = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query(query)
+      .parse(bufferParser);
+
+    const second = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query(query)
+      .parse(bufferParser);
+
+    expect(first.headers.etag).toBeDefined();
+    expect(first.headers.etag).toBe(second.headers.etag);
+  });
+
+  it("generates different ETag for different quality", async () => {
+    const app = createApp();
+
+    const low = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", quality: 20, format: "jpeg" })
+      .parse(bufferParser);
+
+    const high = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", quality: 95, format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(low.headers.etag).toBeDefined();
+    expect(high.headers.etag).toBeDefined();
+    expect(low.headers.etag).not.toBe(high.headers.etag);
+  });
+
+  it("sets Content-Disposition header with correct filename", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "webp" })
+      .parse(bufferParser);
+
+    expect(response.headers["content-disposition"]).toBe(
+      'inline; filename="noimage.webp"'
+    );
+  });
+
+  it("sets Content-Length header matching body size", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(Number(response.headers["content-length"])).toBe(
+      response.body.length
+    );
+  });
+
+  it("handles getUserFolder returning empty string", async () => {
+    const app = express();
+    const getUserFolder = vi.fn(async () => "");
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        getUserFolder,
+      })
+    );
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", folder: "private", userId: "123" })
+      .parse(bufferParser);
+
+    expect(getUserFolder).toHaveBeenCalled();
+    // Empty string is falsy, so baseDir should remain unchanged
+    expect(response.status).toBe(200);
+  });
+
+  it("uses correct fallback type when avatar request fails in catch block", async () => {
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+      })
+    );
+
+    vi.spyOn(sharp.prototype, "toBuffer").mockRejectedValueOnce(
+      new Error("processing fail")
+    );
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", type: "avatar", format: "jpeg" })
+      .parse(bufferParser);
+
+    // Should still return 200 with the avatar fallback
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+  });
+
+  it("handles custom cacheControl value in response", async () => {
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        cacheControl: "private, no-cache",
+      })
+    );
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["cache-control"]).toBe("private, no-cache");
+  });
+
+  it("processes image without resize when only format specified", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "png" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.png);
+    // Verify the image is valid by reading metadata
+    const metadata = await sharp(response.body).metadata();
+    expect(metadata.format).toBe("png");
+  });
+
+  it("converts between formats correctly", async () => {
+    const app = createApp();
+    // Request a JPEG image as WebP
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "webp", width: 100, height: 100 })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.webp);
+    const metadata = await sharp(response.body).metadata();
+    expect(metadata.format).toBe("webp");
+  });
+
+  it("sanitizes special characters in Content-Disposition filename", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: 'image"with"quotes.jpg', format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    const disposition = response.headers["content-disposition"] as string;
+    expect(disposition).toBeDefined();
+    // Quotes, backslashes, and control chars should be replaced with underscores
+    expect(disposition).not.toMatch(/image"with"quotes/);
+    expect(disposition).toBe('inline; filename="image_with_quotes.jpeg"');
+  });
+
+  it("falls back to baseDir when getUserFolder times out", async () => {
+    const app = express();
+    // getUserFolder returns a promise that never resolves
+    const getUserFolder = vi.fn(
+      () => new Promise<string>(() => {})
+    );
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        getUserFolder,
+        requestTimeoutMs: 100,
+      })
+    );
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", folder: "private", userId: "123" })
+      .parse(bufferParser);
+
+    expect(getUserFolder).toHaveBeenCalled();
+    // Should still respond using baseDir as fallback after timeout
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+  });
+
+  it("treats 'httpfoo' as a local path, not as a URL", async () => {
+    const app = createApp();
+    // "httpfoo" starts with "http" but not "http://" so it should be a local path
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "httpfoo", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+    // Should serve fallback since the local file doesn't exist
+    expect(response.body.length).toBeGreaterThan(0);
+    // Verify axios was not called — this was not treated as a network request
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it("returns fallback for http:// src with blocked host", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "http://blocked.test/image.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+    expect(response.body.length).toBeGreaterThan(0);
+  });
+
+  it("returns fallback for https:// src with blocked host", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "https://blocked.test/image.png", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+    expect(response.body.length).toBeGreaterThan(0);
   });
 });

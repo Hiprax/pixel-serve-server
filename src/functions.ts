@@ -24,6 +24,7 @@ export const isValidPath = async (
     if (!basePath || !specifiedPath) return false;
     if (specifiedPath.includes("\0")) return false;
     if (path.isAbsolute(specifiedPath)) return false;
+    // eslint-disable-next-line no-control-regex
     if (!/^[^\x00-\x1F]+$/.test(specifiedPath)) return false;
 
     const resolvedBase = path.resolve(basePath);
@@ -77,14 +78,17 @@ const fetchFromNetwork = async (
       validateStatus: (status) => status >= 200 && status < 300,
     });
 
-    const contentType = response.headers["content-type"]?.toLowerCase();
+    const contentType = response.headers["content-type"]
+      ?.toLowerCase()
+      ?.split(";")[0]
+      ?.trim();
     const allowedMimeTypes = Object.values(mimeTypes);
 
     if (allowedMimeTypes.includes(contentType ?? "")) {
       return Buffer.from(response.data);
     }
     return await FALLBACKIMAGES[type]();
-  } catch (error) {
+  } catch {
     return await FALLBACKIMAGES[type]();
   }
 };
@@ -100,15 +104,23 @@ const fetchFromNetwork = async (
 export const readLocalImage = async (
   filePath: string,
   baseDir: string,
-  type: ImageType = "normal"
-) => {
+  type: ImageType = "normal",
+  maxBytes?: number
+): Promise<Buffer> => {
   const isValid = await isValidPath(baseDir, filePath);
   if (!isValid) {
     return await FALLBACKIMAGES[type]();
   }
   try {
-    return await fs.readFile(path.resolve(baseDir, filePath));
-  } catch (error) {
+    const resolvedFile = path.resolve(baseDir, filePath);
+    if (maxBytes) {
+      const stats = await fs.stat(resolvedFile);
+      if (stats.size > maxBytes) {
+        return await FALLBACKIMAGES[type]();
+      }
+    }
+    return await fs.readFile(resolvedFile);
+  } catch {
     return await FALLBACKIMAGES[type]();
   }
 };
@@ -142,14 +154,16 @@ export const fetchImage = (
     const url = new URL(src);
     const isInternal =
       websiteURL !== undefined &&
-      [websiteURL, `www.${websiteURL}`].includes(url.host);
+      [websiteURL, `www.${websiteURL}`].includes(url.hostname);
 
     if (isInternal) {
       const localPath = url.pathname.replace(apiRegex, "");
-      return readLocalImage(localPath, baseDir, type);
+      return readLocalImage(localPath, baseDir, type, maxBytes);
     }
 
-    const allowedCondition = allowedNetworkList.includes(url.host);
+    const allowedCondition =
+      allowedNetworkList.includes(url.hostname) ||
+      allowedNetworkList.includes(url.host);
     if (!allowedCondition) {
       return FALLBACKIMAGES[type]();
     }
@@ -158,6 +172,6 @@ export const fetchImage = (
     }
     return fetchFromNetwork(src, type, { timeoutMs, maxBytes });
   } catch {
-    return readLocalImage(src, baseDir, type);
+    return readLocalImage(src, baseDir, type, maxBytes);
   }
 };

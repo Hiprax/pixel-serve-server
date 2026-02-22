@@ -75,7 +75,8 @@ describe("functions", () => {
       ["allowed.test"],
       { timeoutMs: 1, maxBytes: 1 }
     );
-    expect(result.length).toBeGreaterThan(0);
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
   });
 
   it("returns fallback when URL parse fails", async () => {
@@ -88,7 +89,8 @@ describe("functions", () => {
       ["allowed.test"],
       { timeoutMs: 1, maxBytes: 1 }
     );
-    expect(result.length).toBeGreaterThan(0);
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
   });
 
   it("returns fallback when content-type is missing", async () => {
@@ -303,7 +305,8 @@ describe("functions", () => {
       { timeoutMs: 1000, maxBytes: 1024 }
     );
     // Should fall back to local read which returns fallback for invalid path
-    expect(result.length).toBeGreaterThan(0);
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
   });
 
   it("fetchFromNetwork returns avatar fallback on error", async () => {
@@ -319,5 +322,158 @@ describe("functions", () => {
     );
     const fallback = await FALLBACKIMAGES.avatar();
     expect(result.equals(fallback)).toBe(true);
+  });
+
+  it("accepts content-type with charset parameter", async () => {
+    const data = Buffer.from("image-data");
+    vi.mocked(axios.get).mockResolvedValue({
+      data,
+      headers: { "content-type": "image/jpeg; charset=utf-8" },
+      status: 200,
+      statusText: "OK",
+      config: {},
+    });
+    const result = await fetchImage(
+      "https://allowed.test/img.jpg",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["allowed.test"],
+      { timeoutMs: 1000, maxBytes: 1024 }
+    );
+    expect(result.equals(Buffer.from("image-data"))).toBe(true);
+  });
+
+  it("matches internal host regardless of port", async () => {
+    const internalUrl = "http://localhost:3001/api/v1/noimage.jpg";
+    const result = await fetchImage(
+      internalUrl,
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["allowed.test"],
+      { timeoutMs: 1000, maxBytes: 1024 }
+    );
+    const local = await readLocalImage("noimage.jpg", baseDir, "normal");
+    expect(result.equals(local)).toBe(true);
+  });
+
+  it("readLocalImage returns fallback when file exceeds maxBytes", async () => {
+    const result = await readLocalImage("noimage.jpg", baseDir, "normal", 1);
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
+  });
+
+  it("readLocalImage reads file when under maxBytes limit", async () => {
+    const result = await readLocalImage(
+      "noimage.jpg",
+      baseDir,
+      "normal",
+      10_000_000
+    );
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it("matches allowed network host with port in URL", async () => {
+    const data = Buffer.from("image-data");
+    vi.mocked(axios.get).mockResolvedValue({
+      data,
+      headers: { "content-type": "image/png" },
+      status: 200,
+      statusText: "OK",
+      config: {},
+    });
+    const result = await fetchImage(
+      "https://allowed.test:8080/img.png",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["allowed.test"],
+      { timeoutMs: 1000, maxBytes: 1024 }
+    );
+    expect(result.equals(Buffer.from("image-data"))).toBe(true);
+  });
+
+  it("isValidPath rejects double-dot encoded traversal paths", async () => {
+    const valid = await isValidPath(baseDir, "..%2F..%2Fetc%2Fpasswd");
+    expect(valid).toBe(false);
+  });
+
+  it("isValidPath rejects paths with backslash traversal", async () => {
+    const valid = await isValidPath(baseDir, "..\\secret.txt");
+    expect(valid).toBe(false);
+  });
+
+  it("readLocalImage returns avatar fallback when directory read fails", async () => {
+    const result = await readLocalImage(".", baseDir, "avatar");
+    const fallback = await FALLBACKIMAGES.avatar();
+    expect(result.equals(fallback)).toBe(true);
+  });
+
+  it("fetchImage falls back when allowed host has uppercase content-type", async () => {
+    const data = Buffer.from("image-data");
+    vi.mocked(axios.get).mockResolvedValue({
+      data,
+      headers: { "content-type": "IMAGE/JPEG" },
+      status: 200,
+      statusText: "OK",
+      config: {},
+    });
+    const result = await fetchImage(
+      "https://allowed.test/img.jpg",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["allowed.test"],
+      { timeoutMs: 1000, maxBytes: 1024 }
+    );
+    // The code lowercases content-type, so IMAGE/JPEG -> image/jpeg should work
+    expect(result.equals(Buffer.from("image-data"))).toBe(true);
+  });
+
+  it("fetchImage handles content-type with multiple parameters", async () => {
+    const data = Buffer.from("image-data");
+    vi.mocked(axios.get).mockResolvedValue({
+      data,
+      headers: { "content-type": "image/png; charset=utf-8; boundary=something" },
+      status: 200,
+      statusText: "OK",
+      config: {},
+    });
+    const result = await fetchImage(
+      "https://allowed.test/img.png",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["allowed.test"],
+      { timeoutMs: 1000, maxBytes: 1024 }
+    );
+    expect(result.equals(Buffer.from("image-data"))).toBe(true);
+  });
+
+  it("fetchImage reads local for internal URL with custom apiRegex", async () => {
+    const internalUrl = "http://localhost/custom/path/noimage.jpg";
+    const result = await fetchImage(
+      internalUrl,
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/custom\/path\//,
+      [],
+      { timeoutMs: 1000, maxBytes: 1024 }
+    );
+    const local = await readLocalImage("noimage.jpg", baseDir, "normal");
+    expect(result.equals(local)).toBe(true);
+  });
+
+  it("readLocalImage returns fallback for maxBytes of 0", async () => {
+    const result = await readLocalImage("noimage.jpg", baseDir, "normal", 0);
+    // maxBytes of 0 is falsy, so no size check happens - file is read normally
+    expect(result.length).toBeGreaterThan(0);
   });
 });

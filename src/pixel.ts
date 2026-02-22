@@ -36,7 +36,8 @@ const serveImage = async (
   res: Response,
   next: NextFunction,
   options: PixelServeOptions
-) => {
+): Promise<void> => {
+  let requestedType: ImageType = "normal";
   try {
     const parsedOptions = renderOptions(options);
     const userData = renderUserData(req.query as Partial<UserData>, {
@@ -46,6 +47,8 @@ const serveImage = async (
       maxHeight: parsedOptions.maxHeight,
       defaultQuality: parsedOptions.defaultQuality,
     });
+
+    requestedType = (userData.type as ImageType) ?? "normal";
 
     let baseDir = parsedOptions.baseDir;
     let parsedUserId: string | undefined;
@@ -57,9 +60,22 @@ const serveImage = async (
     }
 
     if (userData.folder === "private" && parsedOptions.getUserFolder) {
-      const dir = await parsedOptions.getUserFolder(req, parsedUserId);
-      if (dir) {
-        baseDir = dir;
+      const folderPromise = Promise.resolve(
+        parsedOptions.getUserFolder(req, parsedUserId)
+      );
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("getUserFolder timed out")),
+          parsedOptions.requestTimeoutMs
+        )
+      );
+      try {
+        const dir = await Promise.race([folderPromise, timeoutPromise]);
+        if (dir) {
+          baseDir = dir;
+        }
+      } catch {
+        // getUserFolder timed out or failed — use default baseDir
       }
     }
 
@@ -73,7 +89,10 @@ const serveImage = async (
       if (!userData.src) {
         return FALLBACKIMAGES[userData.type ?? "normal"]();
       }
-      if (userData.src.startsWith("http")) {
+      if (
+        userData.src.startsWith("http://") ||
+        userData.src.startsWith("https://")
+      ) {
         return fetchImage(
           userData.src,
           baseDir,
@@ -87,7 +106,12 @@ const serveImage = async (
           }
         );
       }
-      return readLocalImage(userData.src, baseDir, userData.type as ImageType);
+      return readLocalImage(
+        userData.src,
+        baseDir,
+        userData.type as ImageType,
+        parsedOptions.maxDownloadBytes
+      );
     };
 
     const imageBuffer = await resolveBuffer();
@@ -110,9 +134,11 @@ const serveImage = async (
       })
       .toBuffer();
 
-    const sourceName = userData.src
+    const rawName = userData.src
       ? path.basename(userData.src, path.extname(userData.src))
       : "image";
+    // eslint-disable-next-line no-control-regex
+    const sourceName = rawName.replace(/["\\\x00-\x1F\x7F]/g, "_");
     const processedFileName = `${sourceName}.${outputFormat}`;
 
     const etag = parsedOptions.etag
@@ -139,10 +165,11 @@ const serveImage = async (
     }
     res.setHeader("Content-Length", processedImage.length.toString());
     res.send(processedImage);
-    /* c8 ignore next */
-  } catch (error) {
+  } catch {
     try {
-      const fallback = await FALLBACKIMAGES.normal();
+      const fallbackType =
+        requestedType === "avatar" ? "avatar" : "normal";
+      const fallback = await FALLBACKIMAGES[fallbackType]();
       res.type(mimeTypes.jpeg);
       res.setHeader("Content-Disposition", `inline; filename="fallback.jpeg"`);
       res.setHeader("Cache-Control", "public, max-age=60");
@@ -159,7 +186,9 @@ const serveImage = async (
  * @param {PixelServeOptions} options - The options object for image processing.
  * @returns {function(Request, Response, NextFunction): Promise<void>} The middleware function.
  */
-const registerServe = (options: PixelServeOptions) => {
+const registerServe = (
+  options: PixelServeOptions
+): ((req: Request, res: Response, next: NextFunction) => Promise<void>) => {
   return async (req: Request, res: Response, next: NextFunction) =>
     serveImage(req, res, next, options);
 };

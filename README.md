@@ -3,6 +3,7 @@
 **A modern, type-safe middleware** for processing, resizing, and serving images in Node.js applications. Built with **TypeScript**, powered by **Sharp**, and designed for secure production use with ESM & CJS bundles.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![npm version](https://img.shields.io/npm/v/pixel-serve-server)](https://www.npmjs.com/package/pixel-serve-server)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9.3-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-blue.svg)](https://nodejs.org/)
 
@@ -103,23 +104,23 @@ app.listen(3000);
 
 ## Configuration Options
 
-| Option               | Type                                      | Default                    | Description                                                             |
-| -------------------- | ----------------------------------------- | -------------------------- | ----------------------------------------------------------------------- |
-| `baseDir`            | `string`                                  | **required**               | Base directory for local images                                         |
-| `idHandler`          | `(id: string) => string`                  | `id => id`                 | Transform user IDs before lookup                                        |
-| `getUserFolder`      | `(req, id?) => string \| Promise<string>` | `undefined`                | Resolve private folder path when `folder=private`                       |
-| `websiteURL`         | `string`                                  | `undefined`                | If set, internal URLs pointing to this host are treated as local assets |
-| `apiRegex`           | `RegExp`                                  | `/^\/api\/v1\//`           | Prefix stripped from internal URLs before lookup                        |
-| `allowedNetworkList` | `string[]`                                | `[]`                       | Allowed remote hosts. Others immediately fall back                      |
-| `cacheControl`       | `string`                                  | `public, max-age=86400...` | Cache-Control header value                                              |
-| `etag`               | `boolean`                                 | `true`                     | Emit ETag and honor If-None-Match                                       |
-| `minWidth`           | `number`                                  | `50`                       | Minimum accepted width                                                  |
-| `maxWidth`           | `number`                                  | `4000`                     | Maximum accepted width                                                  |
-| `minHeight`          | `number`                                  | `50`                       | Minimum accepted height                                                 |
-| `maxHeight`          | `number`                                  | `4000`                     | Maximum accepted height                                                 |
-| `defaultQuality`     | `number`                                  | `80`                       | Default JPEG/WebP/AVIF quality                                          |
-| `requestTimeoutMs`   | `number`                                  | `5000`                     | Network fetch timeout                                                   |
-| `maxDownloadBytes`   | `number`                                  | `5_000_000`                | Maximum remote download size                                            |
+| Option               | Type                                      | Default          | Description                                                             |
+| -------------------- | ----------------------------------------- | ---------------- | ----------------------------------------------------------------------- |
+| `baseDir`            | `string`                                  | **required**     | Base directory for local images                                         |
+| `idHandler`          | `(id: string) => string`                  | `id => id`       | Transform user IDs before lookup                                        |
+| `getUserFolder`      | `(req, id?) => string \| Promise<string>` | `undefined`      | Resolve private folder path when `folder=private`                       |
+| `websiteURL`         | `string`                                  | `undefined`      | If set, internal URLs pointing to this host are treated as local assets |
+| `apiRegex`           | `RegExp`                                  | `/^\/api\/v1\//` | Prefix stripped from internal URLs before lookup                        |
+| `allowedNetworkList` | `string[]`                                | `[]`             | Allowed remote hosts. Others immediately fall back                      |
+| `cacheControl`       | `string`                                  | `undefined`      | Cache-Control header value                                              |
+| `etag`               | `boolean`                                 | `true`           | Emit ETag and honor If-None-Match                                       |
+| `minWidth`           | `number`                                  | `50`             | Minimum accepted width                                                  |
+| `maxWidth`           | `number`                                  | `4000`           | Maximum accepted width                                                  |
+| `minHeight`          | `number`                                  | `50`             | Minimum accepted height                                                 |
+| `maxHeight`          | `number`                                  | `4000`           | Maximum accepted height                                                 |
+| `defaultQuality`     | `number`                                  | `80`             | Default JPEG/WebP/AVIF quality                                          |
+| `requestTimeoutMs`   | `number`                                  | `5000`           | Network fetch timeout                                                   |
+| `maxDownloadBytes`   | `number`                                  | `5_000_000`      | Maximum remote download size                                            |
 
 ## Query Parameters
 
@@ -253,7 +254,7 @@ const { registerServe } = require("pixel-serve-server");
 ## Requirements
 
 - Node.js >= 18
-- Express 5.x (peer dependency)
+- Express 5.x (included as a dependency)
 
 ## Dependencies
 

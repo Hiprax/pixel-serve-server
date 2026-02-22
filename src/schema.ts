@@ -87,7 +87,9 @@ export const optionsSchema = z
         (req: unknown, id?: string) => Promise<string> | string
       >((val) => typeof val === "function", { message: "getUserFolder must be a function" })
       .optional(),
-    websiteURL: z.union([z.url(), z.string().regex(/^[\w.-]+$/)]).optional(),
+    websiteURL: z
+      .union([z.url(), z.string().regex(/^(?![-.])([\w]+[-.]?)*[\w]+$/)])
+      .optional(),
     apiRegex: z.instanceof(RegExp).default(API_REGEX),
     allowedNetworkList: z.array(z.string()).default([]),
     cacheControl: z.string().optional(),
@@ -100,7 +102,15 @@ export const optionsSchema = z
     requestTimeoutMs: z.number().int().positive().default(5000),
     maxDownloadBytes: z.number().int().positive().default(5_000_000),
   })
-  .strict();
+  .strict()
+  .refine((data) => data.minWidth <= data.maxWidth, {
+    message: "minWidth must be less than or equal to maxWidth",
+    path: ["minWidth"],
+  })
+  .refine((data) => data.minHeight <= data.maxHeight, {
+    message: "minHeight must be less than or equal to maxHeight",
+    path: ["minHeight"],
+  });
 
 export type ParsedUserData = z.infer<typeof userDataSchema>;
 export type ParsedOptions = z.infer<typeof optionsSchema>;

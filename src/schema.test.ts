@@ -269,4 +269,34 @@ describe("optionsSchema", () => {
       optionsSchema.parse({ baseDir: "/images", defaultQuality: 101 })
     ).toThrow();
   });
+
+  it("rejects minWidth greater than maxWidth", () => {
+    expect(() =>
+      optionsSchema.parse({
+        baseDir: "/images",
+        minWidth: 5000,
+        maxWidth: 100,
+      })
+    ).toThrow("minWidth must be less than or equal to maxWidth");
+  });
+
+  it("rejects minHeight greater than maxHeight", () => {
+    expect(() =>
+      optionsSchema.parse({
+        baseDir: "/images",
+        minHeight: 5000,
+        maxHeight: 100,
+      })
+    ).toThrow("minHeight must be less than or equal to maxHeight");
+  });
+
+  it("accepts minWidth equal to maxWidth", () => {
+    const result = optionsSchema.parse({
+      baseDir: "/images",
+      minWidth: 500,
+      maxWidth: 500,
+    });
+    expect(result.minWidth).toBe(500);
+    expect(result.maxWidth).toBe(500);
+  });
 });

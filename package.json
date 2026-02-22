@@ -1,6 +1,6 @@
 {
   "name": "pixel-serve-server",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "A robust Node.js utility for handling and processing images. This package provides features like resizing, format conversion and etc.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -64,6 +64,7 @@
     "supertest": "^7.1.4",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.0",
     "vitest": "^4.0.15"
   },
   "engines": {

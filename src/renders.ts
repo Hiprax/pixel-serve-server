@@ -61,7 +61,7 @@ export const renderUserData = (
 ): ParsedUserData => {
   const parsed = userDataSchema.parse(userData);
 
-  const clamp = (value: number | undefined, min: number, max: number) => {
+  const clamp = (value: number | undefined, min: number, max: number): number | undefined => {
     if (value === undefined) return undefined;
     return Math.min(Math.max(value, min), max);
   };
