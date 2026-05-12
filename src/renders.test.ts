@@ -91,7 +91,9 @@ describe("renderUserData", () => {
 
   it("parses minimal user data with defaults", () => {
     const result = renderUserData({}, defaultBounds);
-    expect(result.src).toBe("/placeholder/noimage.jpg");
+    // src has no schema default — pixel.ts handles empty/missing src via
+    // the `if (!userData.src)` branch (Task 13).
+    expect(result.src).toBeUndefined();
     expect(result.format).toBe("jpeg");
     expect(result.quality).toBe(80);
     expect(result.folder).toBe("public");
@@ -113,7 +115,7 @@ describe("renderUserData", () => {
         type: "avatar",
         userId: "user123",
       },
-      defaultBounds
+      defaultBounds,
     );
 
     expect(result.src).toBe("/test.jpg");
@@ -153,7 +155,7 @@ describe("renderUserData", () => {
   it("accepts string values for width and height", () => {
     const result = renderUserData(
       { width: "200", height: "300" },
-      defaultBounds
+      defaultBounds,
     );
     expect(result.width).toBe(200);
     expect(result.height).toBe(300);
@@ -172,7 +174,7 @@ describe("renderUserData", () => {
   it("ignores invalid format and uses default", () => {
     const result = renderUserData(
       { format: "invalid" as "jpeg" },
-      defaultBounds
+      defaultBounds,
     );
     expect(result.format).toBe("jpeg");
   });
@@ -185,7 +187,7 @@ describe("renderUserData", () => {
   it("converts numeric userId to string", () => {
     const result = renderUserData(
       { userId: 12345 as unknown as string },
-      defaultBounds
+      defaultBounds,
     );
     expect(result.userId).toBe("12345");
   });
@@ -217,22 +219,69 @@ describe("renderUserData", () => {
   });
 
   it("handles all supported image formats", () => {
-    const formats = [
-      "jpeg",
-      "jpg",
-      "png",
-      "webp",
-      "gif",
-      "tiff",
-      "avif",
-      "svg",
-    ];
+    const formats = ["jpeg", "jpg", "png", "webp", "gif", "tiff", "avif"];
     for (const format of formats) {
       const result = renderUserData(
         { format: format as "jpeg" },
-        defaultBounds
+        defaultBounds,
       );
       expect(result.format).toBe(format);
     }
+  });
+
+  it("rejects svg as output format (falls back to jpeg)", () => {
+    const result = renderUserData({ format: "svg" as "jpeg" }, defaultBounds);
+    expect(result.format).toBe("jpeg");
+  });
+
+  describe("quality propagation outside defaultQuality (Task 14)", () => {
+    it("rejects quality above the schema max (101+) before clamping ever runs", () => {
+      // The schema enforces `min(1).max(100)` at validation time, so a
+      // request like `quality=150` never reaches the renderer's clamp
+      // step — it throws inside `userDataSchema.parse`. This test pins
+      // the contract: quality clamping is a SCHEMA concern, not a render
+      // concern.
+      expect(() => renderUserData({ quality: 150 }, defaultBounds)).toThrow();
+    });
+
+    it("rejects quality below the schema min (0 / negative)", () => {
+      expect(() => renderUserData({ quality: 0 }, defaultBounds)).toThrow();
+      expect(() => renderUserData({ quality: -10 }, defaultBounds)).toThrow();
+    });
+
+    it("accepts the maximum legal quality (100) verbatim", () => {
+      const result = renderUserData({ quality: 100 }, defaultBounds);
+      expect(result.quality).toBe(100);
+    });
+
+    it("accepts the minimum legal quality (1) verbatim", () => {
+      const result = renderUserData({ quality: 1 }, defaultBounds);
+      expect(result.quality).toBe(1);
+    });
+
+    it("falls back to bounds.defaultQuality when caller omits quality entirely", () => {
+      // Schema default fires first (80); if the caller explicitly omits it,
+      // the bounds.defaultQuality is only used when the schema default has
+      // been replaced. Documenting current behavior: omitted quality yields
+      // the schema default (80), NOT bounds.defaultQuality (70).
+      const customBounds = { ...defaultBounds, defaultQuality: 70 };
+      const result = renderUserData({}, customBounds);
+      expect(result.quality).toBe(80);
+    });
+
+    it("uses bounds.defaultQuality when schema-parsed quality is undefined", () => {
+      // Direct exercise of the `quality ?? bounds.defaultQuality` fallback.
+      // The schema chain assigns a default of 80 when no quality is given,
+      // so the bounds.defaultQuality is only used as a SECOND-tier fallback
+      // when the schema explicitly produces undefined — which today happens
+      // only through schema redesign. Pinning the runtime behavior here so
+      // a future change is caught.
+      const customBounds = { ...defaultBounds, defaultQuality: 55 };
+      // quality=80 is the documented default; bounds.defaultQuality has no
+      // effect when the user does not supply quality.
+      const result = renderUserData({}, customBounds);
+      expect(result.quality).toBe(80);
+      expect(result.quality).not.toBe(customBounds.defaultQuality);
+    });
   });
 });

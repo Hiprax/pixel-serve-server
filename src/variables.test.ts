@@ -30,11 +30,14 @@ describe("variables", () => {
       expect(allowedFormats).toContain("gif");
       expect(allowedFormats).toContain("tiff");
       expect(allowedFormats).toContain("avif");
-      expect(allowedFormats).toContain("svg");
     });
 
-    it("has exactly 8 formats", () => {
-      expect(allowedFormats.length).toBe(8);
+    it("has exactly 7 formats", () => {
+      expect(allowedFormats.length).toBe(7);
+    });
+
+    it("does not include svg (sharp cannot encode svg output)", () => {
+      expect(allowedFormats).not.toContain("svg");
     });
   });
 
@@ -47,7 +50,10 @@ describe("variables", () => {
       expect(mimeTypes.gif).toBe("image/gif");
       expect(mimeTypes.tiff).toBe("image/tiff");
       expect(mimeTypes.avif).toBe("image/avif");
-      expect(mimeTypes.svg).toBe("image/svg+xml");
+    });
+
+    it("does not include svg mime mapping", () => {
+      expect(mimeTypes.svg).toBeUndefined();
     });
   });
 

@@ -1,6 +1,6 @@
 import { optionsSchema, userDataSchema } from "./schema";
 import type { ParsedOptions, ParsedUserData } from "./schema";
-import type { PixelServeOptions, UserData } from "./types";
+import type { ImageFormat, PixelServeOptions } from "./types";
 
 /**
  * @typedef {("avatar" | "normal")} ImageType
@@ -8,8 +8,9 @@ import type { PixelServeOptions, UserData } from "./types";
  */
 
 /**
- * @typedef {("jpeg" | "jpg" | "png" | "webp" | "gif" | "tiff" | "avif" | "svg")} ImageFormat
- * @description Supported formats for image processing.
+ * @typedef {("jpeg" | "jpg" | "png" | "webp" | "gif" | "tiff" | "avif")} ImageFormat
+ * @description Supported output formats. SVG is intentionally excluded because
+ *   Sharp/libvips cannot re-encode SVG output.
  */
 
 /**
@@ -49,19 +50,36 @@ export const renderOptions = (options: PixelServeOptions): ParsedOptions =>
  * @param {Partial<UserData>} userData - The user-provided data.
  * @returns {UserData} The rendered user data object.
  */
+/**
+ * Result of `renderUserData`. Narrower than `ParsedUserData` (Zod-inferred):
+ * `format` is guaranteed to be an `ImageFormat` (defaulting to `"jpeg"`),
+ * and `quality` is guaranteed to be a number (defaulting to
+ * `bounds.defaultQuality`). The remaining fields keep their Zod-inferred
+ * types, so callers can drop ad-hoc `as ImageFormat` / `as ImageType`
+ * casts in favor of the validated shape.
+ */
+export type RenderedUserData = Omit<ParsedUserData, "format" | "quality"> & {
+  format: ImageFormat;
+  quality: number;
+};
+
 export const renderUserData = (
-  userData: Partial<UserData>,
+  userData: unknown,
   bounds: {
     minWidth: number;
     maxWidth: number;
     minHeight: number;
     maxHeight: number;
     defaultQuality: number;
-  }
-): ParsedUserData => {
+  },
+): RenderedUserData => {
   const parsed = userDataSchema.parse(userData);
 
-  const clamp = (value: number | undefined, min: number, max: number): number | undefined => {
+  const clamp = (
+    value: number | undefined,
+    min: number,
+    max: number,
+  ): number | undefined => {
     if (value === undefined) return undefined;
     return Math.min(Math.max(value, min), max);
   };

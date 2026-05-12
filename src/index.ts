@@ -6,4 +6,19 @@
 export { default as registerServe } from "./pixel";
 export * from "./types";
 export { optionsSchema, userDataSchema } from "./schema";
-export { isValidPath } from "./functions";
+export {
+  isValidPath,
+  isPrivateIp,
+  isPublicHost,
+  resolvePinnedAddress,
+  buildPinnedAgents,
+  stripApiPrefix,
+} from "./functions";
+export {
+  buildFilename,
+  buildSourceIdentifier,
+  buildDeterministicEtag,
+  isInsideRoot,
+  looksLikeSvg,
+  resolveRootDir,
+} from "./pixel";

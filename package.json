@@ -1,15 +1,20 @@
 {
   "name": "pixel-serve-server",
-  "version": "1.0.3",
+  "version": "2.8.3",
   "description": "A robust Node.js utility for handling and processing images. This package provides features like resizing, format conversion and etc.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
     },
     "./assets/*": "./dist/assets/*",
     "./package.json": "./package.json"
@@ -17,14 +22,22 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup",
+    "check-types-pack": "attw --pack .",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "format": "prettier --check \"src/**/*.{ts,tsx}\"",
     "test": "vitest run --coverage",
-    "test:watch": "vitest watch"
+    "test:watch": "vitest watch",
+    "type-check": "tsc --noEmit",
+    "verify": "node scripts/verify.mjs",
+    "branch": "node scripts/new-branch.mjs",
+    "sync": "node scripts/sync-main.mjs",
+    "release:prepare": "node scripts/release-prepare.mjs",
+    "release:tag": "node scripts/release-tag.mjs"
   },
   "files": [
     "dist",
-    "dist/assets"
+    "dist/assets",
+    "SECURITY.md"
   ],
   "repository": {
     "type": "git",
@@ -49,25 +62,27 @@
     "axios": "^1.13.2",
     "express": "^5.2.1",
     "sharp": "^0.34.5",
-    "zod": "^4.1.13"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.2",
+    "@eslint/js": "^10.0.1",
     "@types/express": "^5.0.6",
-    "@types/node": "^24.10.1",
-    "@types/supertest": "^6.0.3",
-    "@typescript-eslint/eslint-plugin": "^8.48.1",
-    "@typescript-eslint/parser": "^8.48.1",
-    "@vitest/coverage-v8": "^4.0.15",
-    "eslint": "^9.39.1",
+    "@types/node": "^25.7.0",
+    "@types/supertest": "^7.2.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.3",
+    "@typescript-eslint/parser": "^8.59.3",
+    "@vitest/coverage-v8": "^4.1.6",
+    "eslint": "^10.3.0",
     "eslint-config-prettier": "^10.1.8",
-    "prettier": "^3.7.4",
-    "supertest": "^7.1.4",
+    "prettier": "^3.8.3",
+    "supertest": "^7.2.2",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.56.0",
-    "vitest": "^4.0.15"
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.3",
+    "vitest": "^4.1.6"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

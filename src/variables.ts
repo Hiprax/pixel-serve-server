@@ -34,7 +34,6 @@ export const allowedFormats: ImageFormat[] = [
   "gif",
   "tiff",
   "avif",
-  "svg",
 ];
 
 export const mimeTypes: Readonly<Record<string, string>> = {
@@ -45,5 +44,4 @@ export const mimeTypes: Readonly<Record<string, string>> = {
   gif: "image/gif",
   tiff: "image/tiff",
   avif: "image/avif",
-  svg: "image/svg+xml",
 };
