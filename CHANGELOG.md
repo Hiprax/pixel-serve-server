@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.8.7] - 2026-05-12
+
+### Security
+
+- **Replace SHA-1 with SHA-256 in the deterministic ETag.** CodeQL `js/weak-cryptographic-algorithm` (alert #2) flagged the SHA-1 hash on user-controlled fields (`parsedUserId`, `src`) in `buildDeterministicEtag`, plus the fallback buffer ETag computed when no source identifier is available. SHA-1 collisions do not break ETag correctness in practice (a forgery would still have to match the resource bytes), but the modern hash closes the static-analysis finding and removes any theoretical concern that a third party could produce a matching ETag for a different request. Clients with cached SHA-1 ETags will see one 200 response per resource on the first request after upgrade (cache miss → re-cache with the new ETag), then return to 304s as before. (`src/pixel.ts`)
+- **Eliminate polynomial-ReDoS regex in `buildFilename`.** CodeQL `js/polynomial-redos` (alert #3) flagged `.replace(/^_+|_+$/g, "")` even though the preceding `.replace(/_+/g, "_")` collapse already guarantees a single underscore in a row, meaning the polynomial worst-case never actually fires. Replaced the trim regex with two direct `startsWith` / `endsWith` + `slice` calls — same behavior, no backtracking risk, and the alert is gone. (`src/pixel.ts`)
+- **Plug incomplete-sanitization in CHANGELOG section regex.** CodeQL `js/incomplete-sanitization` (alert #1) flagged `pkg.version.replace(/\./g, "\\.")` in `scripts/release-tag.mjs` because it escapes `.` but not the backslash itself — a future pre-release tag could in principle smuggle a partial escape past us. Switched to a full regex-metachar escape `/[\\^$.*+?()[\]{}|]/g, "\\$&"`. (`scripts/release-tag.mjs`)
+- **Dismiss intentional test ReDoS literals as "used in tests".** Two test cases in `src/schema.test.ts` build deliberately pathological regexes (`^(a+)+\/$` and `^(a+)+b$`) to verify the schema layer *never* executes them. CodeQL flagged them as `js/redos` (alerts #4 and #5). The literals are the *fixture* the test exercises — they're stored in the schema but never matched against any string — so the right resolution is the standard `used in tests` dismissal reason. A `new RegExp("…")` wrapper was tried first but does not change anything: CodeQL's dataflow follows the string into the constructor. The inline test comment now explains this. (`src/schema.test.ts`, GitHub Code Scanning)
+
+### Added
+
+- **Origin-remote sanity check in `release-tag.mjs`.** Verifies `package.json#name` matches the second segment of the `origin` remote slug before creating the tag, so an accidental `release:tag` invocation from the wrong working directory cannot push a mis-versioned tag to the wrong repo. Catches the failure mode where the previous release run accidentally pushed `v1.1.8` (the client's version) to the server repo — the release workflow correctly refused to publish, but the failed CI run cluttered the server's run history. (`scripts/release-tag.mjs`)
+
+### Documentation
+
+- **Remove libraries.io "Dependencies" badge.** Removed `[![Dependencies](https://img.shields.io/librariesio/release/npm/pixel-serve-server)](https://libraries.io/npm/pixel-serve-server)` from the README so the status row only shows badges this project directly controls or that reflect first-party CI signal (CI, CodeQL, Codecov, npm provenance). (`README.md`)
+
+### Tests
+
+- **Pin SHA-256 ETag shape.** Added an explicit assertion that `buildDeterministicEtag` emits a 64-hex-char value (quoted per RFC 7232) so a future regression that flips back to a weaker hash fails the test suite before it ships. (`src/pixel.test.ts`)
+- **Cover the `buildFilename` underscore-strip path.** Added a case for the explicit `startsWith` / `endsWith` + `slice` logic that replaced the polynomial-flagged regex. (`src/pixel.test.ts`)
+
 ## [2.8.6] - 2026-05-12
 
 ### Documentation

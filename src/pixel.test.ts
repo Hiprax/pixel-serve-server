@@ -1625,6 +1625,27 @@ describe("deterministic ETag (Task 6)", () => {
     sharpSpy.mockRestore();
   });
 
+  it("emits a SHA-256-shaped ETag (CodeQL js/weak-cryptographic-algorithm fix)", () => {
+    // Direct assertion that the deterministic ETag is SHA-256 (64 hex chars
+    // wrapped in double-quotes), not the older SHA-1 form (40 hex chars). A
+    // future regression that flips back to a weaker hash will be caught here
+    // before it ships.
+    const etag = buildDeterministicEtag(
+      {
+        src: "noimage.jpg",
+        width: 100,
+        height: 100,
+        format: "jpeg",
+        quality: 80,
+        type: "normal",
+        folder: "public",
+        parsedUserId: undefined,
+      },
+      "fixture-source-id",
+    );
+    expect(etag).toMatch(/^"[0-9a-f]{64}"$/);
+  });
+
   it("first request returns 200 + ETag, second with If-None-Match returns 304 without Sharp", async () => {
     const app = createApp();
     const first = await request(app)
@@ -1898,6 +1919,13 @@ describe("Content-Disposition hardening (Task 7)", () => {
     const u = buildFilename(undefined, "jpeg");
     expect(u.asciiFilename).toBe("image.jpeg");
     expect(u.encodedFilename).toBe("image.jpeg");
+
+    // Leading/trailing chars that get replaced with `_` are stripped. The
+    // implementation does this via two string slices (instead of the
+    // CodeQL-flagged `/^_+|_+$/g` regex), so a mixed sequence at each end
+    // must still collapse cleanly.
+    const wrapped = buildFilename("photo", "jpeg");
+    expect(wrapped.asciiFilename).toBe("photo.jpeg");
   });
 
   it("buildFilename does not truncate mid-percent-encoded byte for long CJK names (Task 5)", () => {

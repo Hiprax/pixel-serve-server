@@ -529,6 +529,12 @@ describe("apiRegex performance (Task 14)", () => {
     // supply a regex that would be catastrophic if run against the wrong
     // input, but `optionsSchema.parse` must finish in microseconds because
     // it only validates the instanceof check.
+    //
+    // CodeQL flags the pathological literal below with `js/redos`. The
+    // matching alerts are dismissed in the repo settings with reason
+    // "used in tests" — the literal IS the fixture the test exercises, and
+    // dressing it up via `new RegExp("…")` does not fool the dataflow
+    // analysis (it still tracks the string into the constructor).
     const pathological = /^(a+)+\/$/;
     const start = Date.now();
     const result = optionsSchema.parse({
@@ -547,7 +553,8 @@ describe("apiRegex performance (Task 14)", () => {
     // pathological regex against 50k chars would exhibit catastrophic
     // backtracking. Construct the regex but DO NOT execute it manually
     // anywhere in this assertion — we are checking the schema layer, not
-    // the runtime usage path.
+    // the runtime usage path. The literal is intentional (see comment on
+    // the test above for why a `new RegExp("…")` wrapper does not help).
     const evilRegex = /^(a+)+b$/;
     const giantPath = "a".repeat(50_000);
     // The presence of `giantPath` in the closure ensures the test object
