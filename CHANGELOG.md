@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.8.5] - 2026-05-12
+
+### Tests
+
+- **Align `isInsideRoot` symlink-escape test with the v2.8.4 fix.** The Linux leg of CI surfaced a follow-up: the existing test `"isInsideRoot rejects symlink escapes from the candidate side via path.relative (Task 7)"` was asserting `true` for a symlink-inside-root-pointing-outside scenario, documenting the *old* lexical-only design where symlink escapes were deferred to `isValidPath`. With v2.8.4 making the containment check realpath the candidate as well (the safer default), that scenario must return `false`. Renamed the test to `"… via fs.realpath"`, flipped the assertion to `toBe(false)`, and rewrote the comment to describe the realpath behavior. Also tightened the `isInsideRoot` JSDoc in `src/pixel.ts` to describe the realpath-both-sides design. (`src/pixel.test.ts`, `src/pixel.ts`)
+
+### Notes
+
+- Patch bump (`2.8.4` → `2.8.5`): test + docs alignment to the same hardening landed in v2.8.4. Both v2.8.3 and v2.8.4 tags exist on GitHub but their `release.yml` runs failed at the Test step before publishing, so `v2.8.5` is the first version on npm carrying the CI/release scaffold (originally targeted for v2.8.3), the symlink-containment fix (originally targeted for v2.8.4), and this test alignment. The orphan v2.8.3 / v2.8.4 GitHub tags can be deleted later via the GitHub UI without affecting npm.
+
 ## [2.8.4] - 2026-05-12
 
 ### Security

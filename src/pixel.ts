@@ -271,25 +271,24 @@ const raceWithTimeout = async <T>(
  * implementation cannot expand the framework's filesystem surface area
  * beyond an opt-in root.
  *
- * Containment is checked **lexically on the candidate side** so that lazy
- * per-user directories (created on first write) are accepted before they
- * exist on disk. The root side is normalized via `fs.realpath` when
- * possible — symlinks pointing into the root resolve correctly — and falls
- * back to lexical `path.resolve` when the root itself cannot be read.
- *
- * Symlink escapes from the candidate side (e.g., a symlink inside the root
- * that points outward) are caught later by `isValidPath`'s realpath check
- * inside `readLocalImage`. The two-pass design covers both states:
- *   1. lexical containment here for the missing-directory case,
- *   2. realpath there for the symlink-escape case.
+ * Both the **root** and the **candidate** are normalized via `fs.realpath`
+ * before the containment check. This catches symlink escapes (a path that
+ * lexically lives inside the root but whose final segment is a symlink
+ * pointing outward) at the containment layer rather than waiting for the
+ * downstream `isValidPath` read. When `fs.realpath` fails — typically
+ * because the candidate is a lazy per-user directory that doesn't exist
+ * yet — the function falls back to the lexical `path.resolve` value so
+ * containment can still be evaluated; the descendant `isValidPath()`
+ * check then realpaths the actual file before reading.
  *
  * The optional `preResolvedRoot` parameter lets the middleware factory
  * cache the resolved root path once at startup and skip the per-request
  * `fs.realpath` syscall on the root side. When supplied, the function
- * treats it as the already-resolved value and runs the lexical check only.
+ * treats it as the already-resolved value.
  *
  * Returns `true` when the candidate is inside the root (or equal to it).
- * Returns `false` for empty inputs and any escape detected lexically.
+ * Returns `false` for empty inputs and any escape detected lexically or
+ * via realpath.
  */
 export const isInsideRoot = async (
   rootDir: string,

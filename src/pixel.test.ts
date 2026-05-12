@@ -2863,17 +2863,15 @@ describe("getUserFolderRootDir lazy-create + cached realpath (Tasks 7, 8)", () =
     }
   });
 
-  it("isInsideRoot rejects symlink escapes from the candidate side via path.relative (Task 7)", async () => {
-    // Lexically, a symlinked path inside root looks fine — `path.relative`
-    // returns a clean child segment. The symlink would resolve elsewhere
-    // on disk; that escape is caught later by isValidPath's realpath check
-    // inside readLocalImage, not by isInsideRoot's lexical containment.
-    // The test below confirms a candidate that IS lexically a descendant
-    // passes isInsideRoot regardless of where the underlying symlink points.
+  it("isInsideRoot rejects symlink escapes from the candidate side via fs.realpath (Task 7)", async () => {
+    // A path that is *lexically* a descendant of root but whose final
+    // segment is a symlink pointing outside root MUST be rejected at the
+    // containment layer, not just at the later isValidPath() read. The
+    // realpath of the candidate is compared against the realpath of the
+    // root; a target outside the root returns `false`.
     if (process.platform === "win32") {
-      // Symlink creation on Win32 requires admin/developer mode. The lexical
-      // containment property is identical across platforms, so the POSIX
-      // path is enough.
+      // Symlink creation on Win32 requires admin / developer mode. Skip
+      // gracefully on Windows — Linux CI exercises this property.
       return;
     }
     const fsmod = await import("node:fs/promises");
@@ -2891,9 +2889,8 @@ describe("getUserFolderRootDir lazy-create + cached realpath (Tasks 7, 8)", () =
       } catch {
         return; // unsupported platform
       }
-      // Lexically descendants -> passes lexical check. Symlink escapes are
-      // caught later by isValidPath inside readLocalImage.
-      expect(await isInsideRoot(rootDir, linkPath)).toBe(true);
+      // realpath(linkPath) === outside, which is not inside rootDir.
+      expect(await isInsideRoot(rootDir, linkPath)).toBe(false);
     } finally {
       await fsmod.rm(rootDir, { recursive: true, force: true });
       await fsmod.rm(outside, { recursive: true, force: true });
