@@ -101,14 +101,17 @@ export const buildFilename = (
       : "";
 
   // ASCII fallback: replace any byte outside the safe printable ASCII range,
-  // plus quote / backslash / control / DEL, with `_`. Then collapse runs of
-  // `_` and trim leading/trailing underscores so the output is still readable.
-  const asciiBase = baseNoExt
+  // plus quote / backslash / control / DEL, with `_`. Collapse runs of `_`
+  // into one, then strip a single leading/trailing `_` via direct string
+  // ops — the regex form `/^_+|_+$/g` is flagged by CodeQL `js/polynomial-redos`
+  // even though the prior collapse guarantees a single underscore in a row.
+  let asciiBase = baseNoExt
     .replace(/[^\x20-\x7E]/g, "_")
     // eslint-disable-next-line no-control-regex
     .replace(/["\\\x00-\x1F\x7F]/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
+    .replace(/_+/g, "_");
+  if (asciiBase.startsWith("_")) asciiBase = asciiBase.slice(1);
+  if (asciiBase.endsWith("_")) asciiBase = asciiBase.slice(0, -1);
 
   const safeAsciiBase =
     asciiBase.length > 0 ? asciiBase : ASCII_FALLBACK_DEFAULT;
@@ -200,8 +203,14 @@ export const buildSourceIdentifier = async (
 };
 
 /**
- * Builds the deterministic SHA1 ETag from the resolved user data + source
+ * Builds the deterministic SHA-256 ETag from the resolved user data + source
  * identifier. The result is wrapped in double-quotes per RFC 7232.
+ *
+ * SHA-256 is used over SHA-1 because the input contains user-controlled fields
+ * (post-`idHandler` userId, src). SHA-1's collision weakness flagged by CodeQL
+ * `js/weak-cryptographic-algorithm` does not affect ETag correctness in
+ * practice, but a modern hash keeps static analysis green and removes any
+ * theoretical concern about a third party forging a matching ETag.
  */
 export const buildDeterministicEtag = (
   fields: {
@@ -227,7 +236,7 @@ export const buildDeterministicEtag = (
     u: fields.parsedUserId ?? "",
     sid: sourceIdentifier,
   });
-  return `"${createHash("sha1").update(key).digest("hex")}"`;
+  return `"${createHash("sha256").update(key).digest("hex")}"`;
 };
 
 /**
@@ -750,7 +759,7 @@ const serveImage = async (
     // hash the processed buffer. This preserves the historical behavior for
     // sources that cannot produce a stable key (e.g., missing file paths).
     if (parsedOptions.etag && !etag) {
-      etag = `"${createHash("sha1").update(processedImage).digest("hex")}"`;
+      etag = `"${createHash("sha256").update(processedImage).digest("hex")}"`;
       if (req.headers["if-none-match"] === etag) {
         res.status(304).end();
         safeOnComplete(onComplete, {
