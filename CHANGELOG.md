@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.8.4] - 2026-05-12
+
+### Security
+
+- **Fix symlink escape in `getUserFolderRootDir` containment.** The Linux leg of the new CI matrix surfaced a latent bug in `isInsideRoot`: the **root** side was resolved via `fs.realpath`, but the **candidate** side was only resolved lexically through `path.resolve`. That meant a `getUserFolder` result whose final segment was a symlink pointing outside the configured root would still satisfy the lexical-prefix check (because the symlink's *own* path lives inside the root) and be accepted. The fix realpaths the candidate as well, falling back to the lexical resolve only when the candidate doesn't exist on disk yet (the descendant `isValidPath()` still realpaths the final file before reading). Tested with a real symlink (`fs.symlink(outsideDir, linkPath, "dir")`) — the containment check now fires `onError` with `phase: "getUserFolder"` and the response falls back to the public `baseDir`. The Windows test path remains a soft skip because the platform requires admin / developer mode to create symlinks. (`src/pixel.ts`)
+
+### Notes
+
+- Patch bump (`2.8.3` → `2.8.4`): single security fix; no API changes, no exports added or removed, no schema changes. The previous `v2.8.3` git tag exists on GitHub but its `release.yml` run failed at the Test step before the publish step ran, so no `v2.8.3` was ever published to npm — `v2.8.4` is the first version on npm carrying the CI/release scaffold from `v2.8.3` *plus* this symlink fix.
+
 ## [2.8.3] - 2026-05-12
 
 ### Added

@@ -315,8 +315,19 @@ export const isInsideRoot = async (
   }
 
   const lexicalCandidate = path.resolve(candidate);
-  if (realRoot === lexicalCandidate) return true;
-  const relative = path.relative(realRoot, lexicalCandidate);
+  // Resolve the candidate through realpath so a `getUserFolder` result that
+  // is a symlink pointing outside the root is caught here rather than
+  // silently passing the lexical-prefix check. When the candidate does not
+  // exist on disk yet, fall back to the lexical resolve — the descendant
+  // isValidPath() check will realpath the final file before reading.
+  let realCandidate: string;
+  try {
+    realCandidate = await fs.realpath(lexicalCandidate);
+  } catch {
+    realCandidate = lexicalCandidate;
+  }
+  if (realRoot === realCandidate) return true;
+  const relative = path.relative(realRoot, realCandidate);
   if (relative === "" || relative === ".") return true;
   return !relative.startsWith("..") && !path.isAbsolute(relative);
 };
