@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.8.6] - 2026-05-12
+
+### Documentation
+
+- **Replace broken npm-provenance shield with a static "built & signed" badge.** The v2.8.3-era badge URL `https://img.shields.io/npm/sigstore/pixel-serve-server?label=provenance` rendered as `404 badge not found` because shields.io has no `/npm/sigstore/` endpoint (verified by probing `/npm/provenance`, `/npm/has-provenance`, `/sigstore/npm`, `/npm/attestation`, `/npm/sig` — all return the same 404). Swapped in a static `img.shields.io/badge/npm%20provenance-built%20%26%20signed-success?logo=npm&logoColor=white` shield that links through to `npmjs.com/package/pixel-serve-server`, where the real "Built and signed on GitHub Actions" attestation UI lives. Functionally the badge now communicates the same thing without depending on a non-existent endpoint. (`README.md`)
+
+### Notes
+
+- Patch bump (`2.8.5` → `2.8.6`): docs-only — no runtime API changes, no schema changes, no exports added or removed. Re-publishing pushes the corrected README to the npm package page so `https://www.npmjs.com/package/pixel-serve-server` no longer renders the broken badge.
+
 ## [2.8.5] - 2026-05-12
 
 ### Tests

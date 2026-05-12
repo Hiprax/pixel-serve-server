@@ -8,7 +8,7 @@
 [![CodeQL](https://github.com/Hiprax/pixel-serve-server/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Hiprax/pixel-serve-server/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/gh/Hiprax/pixel-serve-server/branch/main/graph/badge.svg)](https://codecov.io/gh/Hiprax/pixel-serve-server)
 [![Dependencies](https://img.shields.io/librariesio/release/npm/pixel-serve-server)](https://libraries.io/npm/pixel-serve-server)
-[![npm provenance](https://img.shields.io/npm/sigstore/pixel-serve-server?label=provenance)](https://www.npmjs.com/package/pixel-serve-server)
+[![npm provenance](https://img.shields.io/badge/npm%20provenance-built%20%26%20signed-success?logo=npm&logoColor=white)](https://www.npmjs.com/package/pixel-serve-server)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-blue.svg)](https://nodejs.org/)
 
