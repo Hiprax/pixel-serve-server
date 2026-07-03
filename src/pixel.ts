@@ -12,8 +12,18 @@ import type {
   PixelServeCompletionContext,
   PixelServeOnComplete,
 } from "./types";
-import { allowedFormats, FALLBACKIMAGES, mimeTypes } from "./variables";
-import { fetchImage, readLocalImage } from "./functions";
+import {
+  allowedFormats,
+  API_REGEX,
+  FALLBACKIMAGES,
+  mimeTypes,
+} from "./variables";
+import {
+  fetchImage,
+  isValidPath,
+  readLocalImage,
+  resolveInternalLocalPath,
+} from "./functions";
 import { renderOptions, renderUserData } from "./renders";
 import type { ParsedOptions } from "./schema";
 
@@ -35,10 +45,10 @@ const reportError = (
 };
 
 /**
- * Best-effort observability hook dispatcher for the success / 304 path.
- * Swallows hook errors so a buggy logger never crashes a request. Returns
- * void. Mirrors `reportError`'s contract so consumers can rely on the same
- * dispatch guarantees for both observability surfaces.
+ * Best-effort observability hook dispatcher for the success / 304 / hard-
+ * fallback paths. Swallows hook errors so a buggy logger never crashes a
+ * request. Returns void. Mirrors `reportError`'s contract so consumers can
+ * rely on the same dispatch guarantees for both observability surfaces.
  */
 const safeOnComplete = (
   hook: PixelServeOnComplete | undefined,
@@ -86,6 +96,17 @@ const elapsedMs = (start: bigint): number => {
  */
 const FILENAME_MAX_LEN = 100;
 const ASCII_FALLBACK_DEFAULT = "image";
+
+/**
+ * Shared Cache-Control values so the happy path, both fallback paths, and
+ * (in a later phase) the 304 short-circuits cannot drift apart. A soft or
+ * hard fallback serves a bundled placeholder, never the requested bytes, so
+ * it must never inherit the long-lived, real-image cache policy — otherwise
+ * a transient failure gets cached as if it were permanent.
+ */
+const DEFAULT_CACHE_CONTROL =
+  "public, max-age=86400, stale-while-revalidate=604800";
+const FALLBACK_CACHE_CONTROL = "public, max-age=60";
 
 export const buildFilename = (
   rawSrc: string | undefined,
@@ -178,28 +199,75 @@ export const buildFilename = (
  * Returns a stable source identifier for the deterministic ETag.
  *
  *  - Local files contribute `mtimeMs:size`, so any edit to the underlying
- *    file invalidates the cache key.
- *  - Remote URLs contribute the resolved URL string. The framework cannot
- *    cheaply re-fetch HEAD per request, so the URL is the strongest
- *    identifier available without paying for the body.
- *  - Anything else (missing file, fallback paths) returns `null` so the
- *    caller falls back to the post-Sharp buffer hash.
+ *    file invalidates the cache key. The local-file branch is gated behind
+ *    `isValidPath` so a traversal / out-of-tree `src` is rejected BEFORE
+ *    `fs.stat` ever runs — without this gate, a traversal `src` that happens
+ *    to reference an existing file outside `baseDir` would still `fs.stat`
+ *    successfully, turning the ETag into an oracle for that file's
+ *    mtime/size and decoupling it from the fallback bytes `readLocalImage`
+ *    actually serves for the same rejected path.
+ *  - An `http(s)` src whose host matches the configured `options.websiteURL`
+ *    (the "internal host" case) is resolved to its on-disk path via
+ *    `resolveInternalLocalPath` — the same helper `fetchImage` uses to
+ *    decide whether to read locally instead of over the network — and falls
+ *    through to the SAME local-file branch below, so its ETag tracks the
+ *    underlying file's `mtime:size` rather than the immutable URL string.
+ *    Without this, overwriting the on-disk file behind an internal-host URL
+ *    never changes its ETag, so a client can be served a stale `304`
+ *    forever.
+ *  - Any other `http(s)` URL contributes the resolved URL string. The
+ *    framework cannot cheaply re-fetch HEAD per request, so the URL is the
+ *    strongest identifier available without paying for the body.
+ *  - A local file (direct path OR resolved from an internal-host URL) whose
+ *    size exceeds the optional `options.maxBytes` returns `null` instead of
+ *    a `file:` identifier: `readLocalImage` refuses to serve a file that
+ *    large and returns the bundled fallback buffer instead, so keying the
+ *    ETag on the oversized file's stat would decouple the ETag from the
+ *    bytes actually served. Mirrors the size guard in `readLocalImage`.
+ *  - Anything else (missing file, out-of-tree/traversal path, fallback
+ *    paths) returns `null` so the caller falls back to the post-Sharp
+ *    buffer hash — which always matches the bytes actually sent.
  */
 export const buildSourceIdentifier = async (
   src: string | undefined,
   baseDir: string,
+  options?: {
+    websiteURL?: string;
+    apiRegex?: RegExp;
+    apiPrefix?: string;
+    maxBytes?: number;
+  },
 ): Promise<string | null> => {
   if (!src) return null;
+
+  const statLocalFile = async (localPath: string): Promise<string | null> => {
+    if (!(await isValidPath(baseDir, localPath))) return null;
+    try {
+      const resolved = path.resolve(baseDir, localPath);
+      const stats = await fs.stat(resolved);
+      if (options?.maxBytes !== undefined && stats.size > options.maxBytes) {
+        return null;
+      }
+      return `file:${stats.mtimeMs}:${stats.size}`;
+    } catch {
+      return null;
+    }
+  };
+
   if (src.startsWith("http://") || src.startsWith("https://")) {
+    const internalLocalPath = resolveInternalLocalPath(
+      src,
+      options?.websiteURL,
+      options?.apiRegex ?? API_REGEX,
+      options?.apiPrefix,
+    );
+    if (internalLocalPath !== null) {
+      return statLocalFile(internalLocalPath);
+    }
     return `url:${src}`;
   }
-  try {
-    const resolved = path.resolve(baseDir, src);
-    const stats = await fs.stat(resolved);
-    return `file:${stats.mtimeMs}:${stats.size}`;
-  } catch {
-    return null;
-  }
+
+  return statLocalFile(src);
 };
 
 /**
@@ -357,12 +425,110 @@ export const resolveRootDir = async (rootDir: string): Promise<string> => {
 };
 
 /**
+ * Matches a `<!DOCTYPE …>` declaration that names `svg` as the document's
+ * root element (e.g. `<!DOCTYPE svg PUBLIC …>` or `<!DOCTYPE svg [ … ]>`).
+ * ANCHORED to the start of the string it is tested against: callers first
+ * strip any leading `<?xml …?>` declaration and `<!-- … -->` comment prolog
+ * (via `skipXmlProlog`), so this matches a genuine top-level DOCTYPE token
+ * and NOT the literal characters `<!doctype svg` appearing inside a comment's
+ * prose (which would wrongly flag a non-SVG document that merely mentions the
+ * phrase). The trailing `(?:[\s[>]|$)` boundary keeps it from false-matching
+ * a longer root name (`<!DOCTYPE svgish>`).
+ *
+ * A DOCTYPE naming `svg` as its root is an unambiguous SVG signal on its own,
+ * independent of where — or whether — the literal `<svg` root tag falls
+ * inside the scanned window: an oversized internal-subset DTD (a
+ * billion-laughs entity-bomb) can pad the `<svg` tag past the 4 KiB window,
+ * so the DOCTYPE's own root name is the only reliable in-window signal.
+ */
+const DOCTYPE_SVG_ROOT = /^<!doctype\s+svg(?:[\s[>]|$)/;
+
+/**
+ * Skips a leading XML prolog — an optional `<?xml …?>` declaration and any
+ * number of `<!-- … -->` comments, in any order, plus surrounding ASCII
+ * whitespace — and returns the remainder of `s` starting at the first real
+ * markup token. Uses `indexOf` only (no regex backtracking), so it stays
+ * linear-time and ReDoS-free on hostile input.
+ *
+ * If a construct is not closed within `s` (e.g. an oversized comment padded
+ * past the 4 KiB scan window so its `-->` never appears in the head),
+ * skipping stops and the still-open remainder is returned as-is; that
+ * remainder then fails the `<!doctype svg` check and the buffer is left to
+ * Sharp's own `meta.format === "svg"` guard (the documented defense-in-depth
+ * layer — see the "metadata-based Sharp guards" tests).
+ */
+const skipXmlProlog = (s: string): string => {
+  let i = 0;
+  const skipWs = (): void => {
+    while (
+      i < s.length &&
+      (s[i] === " " || s[i] === "\t" || s[i] === "\n" || s[i] === "\r")
+    ) {
+      i++;
+    }
+  };
+  for (;;) {
+    skipWs();
+    if (s.startsWith("<?xml", i)) {
+      const end = s.indexOf("?>", i);
+      if (end === -1) return s.slice(i);
+      i = end + 2;
+      continue;
+    }
+    if (s.startsWith("<!--", i)) {
+      const end = s.indexOf("-->", i);
+      if (end === -1) return s.slice(i);
+      i = end + 3;
+      continue;
+    }
+    return s.slice(i);
+  }
+};
+
+/**
+ * Classifies an already-`trimStart()`ed, lowercased head string as SVG or
+ * not. Shared by the latin1/UTF-8 and UTF-16 BOM decode paths so the two
+ * cannot drift. Only ever runs its scans on a head that begins with a
+ * recognized XML prolog, so it never inspects arbitrary raster bytes.
+ *
+ *  - A leading `<svg` root tag is conclusive.
+ *  - Behind a recognized prolog (`<?xml`/`<!--`/`<!doctype`): an in-window
+ *    `<svg[\s>]` root tag is conclusive (the intentionally-conservative
+ *    scan), AND — after skipping the leading `<?xml …?>`/comment prolog — a
+ *    genuine top-level `<!DOCTYPE svg …>` declaration is conclusive even when
+ *    an oversized entity-bomb DTD pushes the `<svg` root past the window.
+ *    Anchoring the DOCTYPE check to the post-prolog position (rather than an
+ *    unanchored substring search) avoids false-positiving a non-SVG document
+ *    whose comment prose merely mentions the characters `<!doctype svg`.
+ *  - Anything else is not SVG.
+ */
+const headLooksLikeSvg = (head: string): boolean => {
+  if (head.startsWith("<svg")) return true;
+  if (
+    head.startsWith("<?xml") ||
+    head.startsWith("<!--") ||
+    head.startsWith("<!doctype")
+  ) {
+    if (/<svg[\s>]/.test(head)) return true;
+    return DOCTYPE_SVG_ROOT.test(skipXmlProlog(head));
+  }
+  return false;
+};
+
+/**
  * Detects whether a buffer is an SVG by inspecting its leading bytes for
  * common SVG / XML markers. Tolerates UTF-8 BOM, UTF-16 BE/LE BOMs, leading
  * ASCII whitespace (incl. whitespace BEFORE a BOM), `<?xml` prologs, and
  * `<!--` comments preceding the `<svg` root element. Reads up to 4 KiB so
  * pathologically large XML prologs cannot push `<svg` out of the inspection
- * window.
+ * window. A `<!DOCTYPE …>` prolog is recognized the same way — and when the
+ * prolog names `svg` as the DOCTYPE's root element (`<!doctype svg`), that
+ * alone is treated as conclusive, even if an oversized internal subset (a
+ * billion-laughs entity-bomb DTD) pushes the `<svg` root past the 4 KiB
+ * window. This DOCTYPE-root signal fires whether the buffer opens directly
+ * with `<!doctype` OR the DOCTYPE sits behind an `<?xml …?>` declaration or
+ * an XML comment (see `DOCTYPE_SVG_ROOT`), so the entity-bomb defense is not
+ * limited to the bare-`<!doctype`-first shape.
  *
  * The detector is intentionally conservative — any buffer that looks even
  * vaguely SVG-shaped is rejected when `allowSvgInput` is false. This guards
@@ -409,11 +575,12 @@ export const looksLikeSvg = (buf: Buffer): boolean => {
       head16 = swapped.toString("utf16le");
     }
     const trimmed = head16.trimStart().toLowerCase();
-    if (trimmed.startsWith("<svg")) return true;
-    if (trimmed.startsWith("<?xml") || trimmed.startsWith("<!--")) {
-      return /<svg[\s>]/.test(trimmed);
-    }
-    return /<svg[\s>]/.test(trimmed);
+    // Shared classifier — identical logic to the latin1/UTF-8 path below, so
+    // the two decode paths cannot drift. Gated on a recognized XML prolog,
+    // so a UTF-16 BOM-prefixed plain-text buffer that merely contains `<svg`
+    // (or the phrase `<!doctype svg`) without a real prolog/DOCTYPE is not
+    // over-blocked.
+    return headLooksLikeSvg(trimmed);
   }
 
   // UTF-8 BOM.
@@ -435,11 +602,7 @@ export const looksLikeSvg = (buf: Buffer): boolean => {
     .toString("latin1")
     .trimStart()
     .toLowerCase();
-  if (head.startsWith("<svg")) return true;
-  if (head.startsWith("<?xml") || head.startsWith("<!--")) {
-    return /<svg[\s>]/.test(head);
-  }
-  return false;
+  return headLooksLikeSvg(head);
 };
 
 /**
@@ -624,8 +787,20 @@ const serveImage = async (
     // ------------------------------------------------------------------
     // `buildSourceIdentifier` swallows its own filesystem errors and returns
     // `null` when no stable key can be derived (missing file, etc.), so this
-    // call cannot throw and does not need its own try/catch.
-    const sourceIdentifier = await buildSourceIdentifier(userData.src, baseDir);
+    // call cannot throw and does not need its own try/catch. The options
+    // mirror what `resolveBuffer` below passes to `fetchImage`/
+    // `readLocalImage`, so the identifier this computes always matches the
+    // branch that will actually serve the bytes.
+    const sourceIdentifier = await buildSourceIdentifier(
+      userData.src,
+      baseDir,
+      {
+        websiteURL: parsedOptions.websiteURL,
+        apiRegex: parsedOptions.apiRegex,
+        apiPrefix: parsedOptions.apiPrefix,
+        maxBytes: parsedOptions.maxDownloadBytes,
+      },
+    );
 
     let etag: string | undefined;
     if (parsedOptions.etag && sourceIdentifier) {
@@ -643,7 +818,18 @@ const serveImage = async (
         sourceIdentifier,
       );
       if (req.headers["if-none-match"] === etag) {
-        // Short-circuit BEFORE Sharp is touched at all.
+        // Short-circuit BEFORE Sharp is touched at all. RFC 9110 §15.4.5: a
+        // 304 SHOULD echo the validators its 200 counterpart would have
+        // sent. This branch only ever matches a genuine deterministic ETag
+        // (a soft fallback always clears `etag`, so a client can never hold
+        // a deterministic ETag for a placeholder), so Cache-Control here is
+        // unconditionally the configured/default value.
+        res.setHeader("Vary", "Accept-Encoding");
+        res.setHeader(
+          "Cache-Control",
+          parsedOptions.cacheControl ?? DEFAULT_CACHE_CONTROL,
+        );
+        res.setHeader("ETag", etag);
         res.status(304).end();
         safeOnComplete(onComplete, {
           src: observedSrc,
@@ -652,14 +838,31 @@ const serveImage = async (
           outputBytes: 0,
           cached: true,
           durationMs: elapsedMs(startedAt),
+          // No bytes are sent on a 304 — there is nothing to characterize as
+          // fallback-or-not for this response.
+          fallback: false,
         });
         return;
       }
     }
 
+    // Set by `markSoftFallback` (threaded into `resolveBuffer` below) when
+    // the resolved buffer turned out to be a bundled placeholder rather than
+    // genuinely-resolved bytes (missing/invalid local file, blocked host,
+    // SSRF-reject, oversized file, transport failure, etc.) — a "soft"
+    // fallback that still flows through Sharp and gets re-encoded like any
+    // other image. Declared fresh on every `serveImage` invocation (never
+    // module- or factory-scoped) so concurrent requests cannot leak the mark
+    // between each other.
+    let servedSoftFallback = false;
+    const markSoftFallback = (): void => {
+      servedSoftFallback = true;
+    };
+
     const resolveBuffer = async (): Promise<Buffer> => {
       if (!userData.src) {
         // userData.type is always present (schema defaults to "normal").
+        markSoftFallback();
         return FALLBACKIMAGES[userData.type]();
       }
       if (
@@ -679,6 +882,7 @@ const serveImage = async (
             maxRedirects: parsedOptions.maxRedirects,
             onError,
             apiPrefix: parsedOptions.apiPrefix,
+            onFallback: markSoftFallback,
           },
         );
       }
@@ -688,10 +892,25 @@ const serveImage = async (
         userData.type,
         parsedOptions.maxDownloadBytes,
         onError,
+        markSoftFallback,
       );
     };
 
     const imageBuffer = await resolveBuffer();
+
+    // A soft fallback served a bundled placeholder, not the requested bytes.
+    // Do not let it inherit the real-image cache profile: discard any
+    // source-derived deterministic ETag so the response is keyed on the
+    // actual placeholder bytes instead — the buffer-hash block below then
+    // runs unconditionally. Without this, a source that already had a
+    // pre-fetch deterministic identifier (e.g. any external URL, whose
+    // identifier is computed before the fetch is even attempted) would ship
+    // a stale ETag that names the *source*, not the placeholder that was
+    // actually sent, letting a future recovered fetch get permanently
+    // 304-locked onto the placeholder.
+    if (servedSoftFallback) {
+      etag = undefined;
+    }
 
     if (!parsedOptions.allowSvgInput && looksLikeSvg(imageBuffer)) {
       const err = new Error("svg input rejected");
@@ -755,12 +974,29 @@ const serveImage = async (
       throw err;
     }
 
-    // Fallback ETag: if no deterministic source identifier was available,
-    // hash the processed buffer. This preserves the historical behavior for
-    // sources that cannot produce a stable key (e.g., missing file paths).
+    // Fallback ETag: if no deterministic source identifier was available, OR
+    // the deterministic ETag was just discarded above because this response
+    // is a soft fallback, hash the processed buffer instead. This preserves
+    // the historical behavior for sources that cannot produce a stable key
+    // (e.g., missing file paths) and additionally keys every soft-fallback
+    // response on the placeholder bytes actually sent.
     if (parsedOptions.etag && !etag) {
       etag = `"${createHash("sha256").update(processedImage).digest("hex")}"`;
       if (req.headers["if-none-match"] === etag) {
+        // RFC 9110 §15.4.5: echo the same validators the 200 would have
+        // sent. Unlike the pre-Sharp 304 above, `servedSoftFallback` is
+        // already known here, so Cache-Control must track it too — otherwise
+        // a recurring placeholder (e.g. a still-missing local file) would get
+        // re-validated under the long-lived real-image policy instead of the
+        // short fallback one it was originally served with.
+        res.setHeader("Vary", "Accept-Encoding");
+        res.setHeader(
+          "Cache-Control",
+          servedSoftFallback
+            ? FALLBACK_CACHE_CONTROL
+            : (parsedOptions.cacheControl ?? DEFAULT_CACHE_CONTROL),
+        );
+        res.setHeader("ETag", etag);
         res.status(304).end();
         safeOnComplete(onComplete, {
           src: observedSrc,
@@ -769,6 +1005,10 @@ const serveImage = async (
           outputBytes: 0,
           cached: true,
           durationMs: elapsedMs(startedAt),
+          // No bytes are sent on a 304 — there is nothing to characterize as
+          // fallback-or-not for this response, even if the resolved buffer
+          // (hashed above) happened to be a soft-fallback placeholder.
+          fallback: false,
         });
         return;
       }
@@ -785,10 +1025,12 @@ const serveImage = async (
       `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`,
     );
     res.setHeader("Vary", "Accept-Encoding");
+    res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader(
       "Cache-Control",
-      parsedOptions.cacheControl ??
-        "public, max-age=86400, stale-while-revalidate=604800",
+      servedSoftFallback
+        ? FALLBACK_CACHE_CONTROL
+        : (parsedOptions.cacheControl ?? DEFAULT_CACHE_CONTROL),
     );
     if (etag) {
       res.setHeader("ETag", etag);
@@ -802,6 +1044,7 @@ const serveImage = async (
       outputBytes: processedImage.length,
       cached: false,
       durationMs: elapsedMs(startedAt),
+      fallback: servedSoftFallback,
     });
   } catch {
     // If the success path already started flushing the response (e.g., a
@@ -823,11 +1066,37 @@ const serveImage = async (
     try {
       const fallbackType = requestedType === "avatar" ? "avatar" : "normal";
       const fallback = await FALLBACKIMAGES[fallbackType]();
-      res.type(mimeTypes.jpeg);
-      res.setHeader("Content-Disposition", `inline; filename="fallback.jpeg"`);
+      // The bundled fallback assets are pre-encoded and sent here VERBATIM
+      // (this error path deliberately skips Sharp re-encoding), so the
+      // response Content-Type and filename extension must match the asset
+      // actually served: the avatar fallback (`noavatar.png`) is a PNG while
+      // the normal fallback (`noimage.jpg`) is a JPEG. Hardcoding JPEG here
+      // mislabels the PNG avatar bytes as `image/jpeg`.
+      const fallbackFormat = fallbackType === "avatar" ? "png" : "jpeg";
+      res.type(mimeTypes[fallbackFormat]);
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="fallback.${fallbackFormat}"`,
+      );
       res.setHeader("Vary", "Accept-Encoding");
-      res.setHeader("Cache-Control", "public, max-age=60");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Cache-Control", FALLBACK_CACHE_CONTROL);
       res.send(fallback);
+      // The hard-fallback path now fires onComplete too (fallback:true) so
+      // every response that resolves to a 200 fires the hook exactly once —
+      // previously this catch branch left onComplete silent entirely,
+      // leaving a consumer unable to distinguish "no completion signal
+      // arrived" from "the pipeline is quietly serving 200s full of
+      // placeholder bytes."
+      safeOnComplete(onComplete, {
+        src: observedSrc,
+        userId: observedUserId,
+        format: fallbackFormat,
+        outputBytes: fallback.length,
+        cached: false,
+        durationMs: elapsedMs(startedAt),
+        fallback: true,
+      });
     } catch (fallbackError) {
       reportError(onError, fallbackError, {
         phase: "fs",

@@ -16,7 +16,7 @@
 - 🖼️ **Dynamic resizing & formatting**: `jpeg`, `png`, `webp`, `gif`, `tiff`, `avif` with configurable width/height bounds and quality limits (SVG is **not** supported as an output format — libvips/Sharp cannot encode SVG)
 - 🌐 **Secure source resolution**: Strict path validation, domain allowlists, and MIME type checks for network fetches
 - 🔒 **Fallbacks & private folders**: Built-in placeholder images plus async `getUserFolder` for private assets
-- ⚡ **Caching ready**: ETag + Cache-Control headers out of the box
+- ⚡ **Caching ready**: ETag + Cache-Control headers out of the box, with fallback-aware short-caching so a placeholder response is never cached as if it were the real image, and `X-Content-Type-Options: nosniff` on every response that carries a body
 - 🧪 **Type-safe & tested**: 100% TypeScript with Vitest coverage and exported Zod schemas
 - ♻️ **Dual builds**: Works in both ESM and CommonJS environments
 
@@ -98,7 +98,9 @@ const serveImage = registerServe({
   // falls back to `baseDir` if it escapes (defense-in-depth realpath check).
   getUserFolderRootDir: "/private/users",
 
-  // Your website's base URL (for treating internal URLs as local)
+  // Your website's host (for treating internal URLs as local). Accepts a
+  // bare hostname, a "host:port" pair, or a full URL — all normalized
+  // internally, no scheme required.
   websiteURL: "example.com",
 
   // Literal-string prefix stripped from internal URL pathnames. When set,
@@ -164,14 +166,17 @@ const serveImage = registerServe({
     console.warn("pixel-serve error", ctx.phase, err);
   },
 
-  // Optional observability hook fired after a successful response (200)
-  // and after the 304 cached short-circuit. Use this to ship per-request
-  // latency metrics or count cache-hit ratios. Throws are swallowed.
+  // Optional observability hook fired after every response that resolves to
+  // a 200 (including a hard-fallback placeholder) or a 304 cached
+  // short-circuit. Use this to ship per-request latency metrics or count
+  // cache-hit ratios. Throws are swallowed.
   onComplete: (ctx) => {
     // ctx: { src?: string, userId?: string, format: ImageFormat,
-    //        outputBytes: number, cached: boolean, durationMs: number }
+    //        outputBytes: number, cached: boolean, durationMs: number,
+    //        fallback: boolean }
     console.log("pixel-serve completed", ctx.format, ctx.durationMs, "ms",
-      ctx.cached ? "(304 cached)" : `${ctx.outputBytes} bytes`);
+      ctx.cached ? "(304 cached)" : `${ctx.outputBytes} bytes`,
+      ctx.fallback ? "(placeholder)" : "");
   },
 });
 
@@ -188,16 +193,16 @@ app.listen(3000);
 | `idHandler`          | `(id: string) => string \| Promise<string>` | `id => id`       | Transform user IDs before lookup. May be sync or async. Throws, rejections, non-string returns, and slow promises that exceed `idHandlerTimeoutMs` are caught — the request falls back to the raw `userId` instead of failing. |
 | `getUserFolder`      | `(req, id?) => string \| Promise<string>` | `undefined`        | Resolve private folder path when `folder=private`                       |
 | `getUserFolderRootDir` | `string`                                | `undefined`        | Optional containment root for `getUserFolder` results. When set, the framework validates that the returned path resolves (via `fs.realpath` + `path.relative`) inside this directory; escapes (`../etc`, symlink redirection, etc.) trigger `onError` with `phase: "getUserFolder"` and the request falls back to the public `baseDir`. When unset, the caller must sanitize `userId` themselves inside `getUserFolder`. |
-| `websiteURL`         | `string`                                  | `undefined`        | If set, internal URLs pointing to this host are treated as local assets |
+| `websiteURL`         | `string`                                  | `undefined`        | If set, internal URLs pointing to this host are treated as local assets. Accepts a bare hostname (`"example.com"`), a `host:port` pair (`"example.com:8080"`), or a full URL (`"https://example.com:8080"`) — all three are normalized to a host internally (scheme, if any, is ignored). A request URL is internal when its hostname or port-qualified `host` matches the normalized value **or** the normalized value prefixed with `www.`. |
 | `apiRegex`           | `RegExp`                                  | `/^\/api\/v1\//`   | Regex stripped from internal URL pathnames before local lookup. **Must be a safe (non-ReDoS) regex** — see [API Prefix and ReDoS Safety](#api-prefix-and-redos-safety) below. Ignored when `apiPrefix` is set. |
 | `apiPrefix`          | `string`                                  | `undefined`        | Optional literal-string prefix stripped from internal URL pathnames. When set, **takes precedence over `apiRegex`** and uses a plain `startsWith` + `slice`, sidestepping the ReDoS risk of a user-supplied regex. Recommended whenever you only need to strip a literal path prefix. |
 | `allowedNetworkList` | `string[]`                                | `[]`               | Allowed remote hosts. Others immediately fall back. **Entries are trimmed and lowercased at schema-parse time**, so `["CDN.Example.com"]` matches a request URL whose hostname the WHATWG URL parser has lowercased to `cdn.example.com`. |
 | `cacheControl`       | `string`                                  | `undefined`        | Cache-Control header value                                              |
 | `etag`               | `boolean`                                 | `true`             | Emit ETag and honor If-None-Match                                       |
-| `minWidth`           | `number`                                  | `50`               | Minimum accepted width                                                  |
-| `maxWidth`           | `number`                                  | `4000`             | Maximum accepted width                                                  |
-| `minHeight`          | `number`                                  | `50`               | Minimum accepted height                                                 |
-| `maxHeight`          | `number`                                  | `4000`             | Maximum accepted height                                                 |
+| `minWidth`           | `number`                                  | `50`               | Minimum accepted width. Must be `>= 50` — the framework's hard floor, enforced at `registerServe()` |
+| `maxWidth`           | `number`                                  | `4000`             | Maximum accepted width. Must be `<= 4000` — the framework's hard ceiling, enforced at `registerServe()` |
+| `minHeight`          | `number`                                  | `50`               | Minimum accepted height. Must be `>= 50` — the framework's hard floor, enforced at `registerServe()` |
+| `maxHeight`          | `number`                                  | `4000`             | Maximum accepted height. Must be `<= 4000` — the framework's hard ceiling, enforced at `registerServe()` |
 | `defaultQuality`     | `number`                                  | `80`               | Default JPEG/WebP/AVIF quality                                          |
 | `requestTimeoutMs`   | `number`                                  | `5000`             | Network fetch timeout                                                   |
 | `idHandlerTimeoutMs` | `number`                                  | `requestTimeoutMs` | Maximum time (ms) to await an async `idHandler` before bailing to the raw `userId`. |
@@ -206,7 +211,7 @@ app.listen(3000);
 | `maxInputPixels`     | `number`                                  | `16_000 * 16_000`  | Maximum input image pixel count enforced by Sharp. Protects against decompression bombs (small encoded buffer that decodes to billions of pixels). Defaults to 256 megapixels. |
 | `allowSvgInput`      | `boolean`                                 | `false`            | Allow SVG inputs through to Sharp/libvips. Defaults to `false` — SVGs can contain malicious payloads (XML bombs, billion-laughs, nested `<use>`) parsed by libvips/librsvg. Detected via magic-byte sniffing and rejected unless this flag is explicitly enabled. |
 | `onError`            | `(err, { phase, src?, userId? }) => void` | `undefined`        | Optional observability hook. Invoked at every catch site so you can ship structured logs / metrics / APM events. Phases include `"sharp"`, `"fetch"`, `"fs"`, `"idHandler"`, `"getUserFolder"`, `"schema"`, and `"validation"`. The hook is best-effort: throws from the hook are suppressed and never break the response. |
-| `onComplete`         | `(ctx: { src?, userId?, format, outputBytes, cached, durationMs }) => void` | `undefined`        | Optional observability hook invoked after the response has been flushed on the happy path (200 with image bytes) and on the 304 cached short-circuit. `format` is the output format actually used; `outputBytes` is the response body size in bytes (0 for 304s); `cached` is `true` when the response was served as 304 Not Modified; `durationMs` is the monotonic end-to-end latency captured via `process.hrtime.bigint()`. Use this hook to ship per-request latency metrics, count cache-hit ratios, or feed structured logs into your APM. The hook is best-effort: throws from the hook are suppressed and never escape the middleware. |
+| `onComplete`         | `(ctx: { src?, userId?, format, outputBytes, cached, durationMs, fallback }) => void` | `undefined`        | Optional observability hook invoked after the response has been flushed on the happy path (200 with image bytes), on the 304 cached short-circuit, and on the hard-fallback path (a 200 serving the bundled placeholder verbatim after the outer pipeline catch) — every response that resolves to a 200 or a 304 fires this hook exactly once. `format` is the output format actually used; `outputBytes` is the response body size in bytes (0 for 304s); `cached` is `true` when the response was served as 304 Not Modified; `durationMs` is the monotonic end-to-end latency captured via `process.hrtime.bigint()`; `fallback` is `true` when the served bytes are a bundled placeholder (soft or hard fallback) rather than a genuinely resolved-and-encoded image — always `false` on a 304. Use this hook to ship per-request latency metrics, count cache-hit ratios, or feed structured logs into your APM. The hook is best-effort: throws from the hook are suppressed and never escape the middleware. |
 
 ## Query Parameters
 
@@ -214,9 +219,9 @@ app.listen(3000);
 | --------- | ----------------------- | ----------- | ------------------------------------------------------------------- |
 | `src`     | `string`                | _required_  | Path or URL to the image source                                     |
 | `format`  | `ImageFormat`           | `jpeg`      | Output format (`jpeg`, `png`, `webp`, `gif`, `tiff`, `avif`). SVG is not supported as an output format. |
-| `width`   | `number`                | `undefined` | Desired output width (px)                                           |
-| `height`  | `number`                | `undefined` | Desired output height (px)                                          |
-| `quality` | `number`                | `80`        | Image quality (1-100)                                               |
+| `width`   | `number`                | `undefined` | Desired output width (px). Validated against the framework's hard `[50, 4000]` window — out-of-window requests return a fallback image rather than being resized — then clamped to the configured `minWidth`/`maxWidth`. |
+| `height`  | `number`                | `undefined` | Desired output height (px). Validated against the framework's hard `[50, 4000]` window — out-of-window requests return a fallback image rather than being resized — then clamped to the configured `minHeight`/`maxHeight`. |
+| `quality` | `number`                | `defaultQuality` | Image quality (1-100). Omitted falls back to the configured `defaultQuality` option (`80` unless overridden) — this is a genuine per-request fallback, not a schema-level default. |
 | `folder`  | `'public' \| 'private'` | `public`    | Image folder type                                                   |
 | `userId`  | `string`                | `undefined` | User ID for private folder access                                   |
 | `type`    | `'normal' \| 'avatar'`  | `normal`    | Image type (affects fallback image)                                 |
@@ -279,8 +284,9 @@ All local paths are validated to prevent directory traversal attacks:
 
 - HTTP redirects are **never auto-followed**. Axios is invoked with `maxRedirects: 0` and the middleware runs a manual redirect loop (default budget: 3 hops, capped at 10 via `maxRedirects`).
 - **Every hop is re-validated**: protocol must be `http`/`https`, host must be in `allowedNetworkList`, and the destination hostname must resolve to a public IP.
-- **Private/loopback/link-local IPs are blocked** even when the host is allowlisted — this stops redirects to RFC1918 ranges, `127.0.0.0/8` loopback, `169.254.0.0/16` link-local (including the AWS IMDS endpoint `169.254.169.254`), IPv6 loopback (`::1`), unique-local (`fc00::/7`), and IPv4-mapped private IPv6.
+- **Private/loopback/link-local IPs are blocked** even when the host is allowlisted — this stops redirects to RFC1918 ranges, `100.64.0.0/10` shared address space (RFC 6598 CGNAT / cloud-internal pod networking), `127.0.0.0/8` loopback, `169.254.0.0/16` link-local (including the AWS IMDS endpoint `169.254.169.254`), `192.88.99.0/24` (RFC 3068, the deprecated IPv4 6to4 anycast relay), IPv6 loopback (`::1`), unique-local (`fc00::/7`), deprecated site-local (`fec0::/10`), IPv4-mapped private IPv6, and NAT64-embedded private IPv4. For the NAT64 well-known prefix (`64:ff9b::/96`), the embedded IPv4 address is extracted and validated so a wrapped private address (e.g. `64:ff9b::7f00:1` → `127.0.0.1`) is blocked while a wrapped public address passes through; the entire NAT64 local-use prefix (`64:ff9b:1::/48`) is blocked outright, since RFC 8215 permits it to carry private addresses and it is intended only for an operator's own limited/local NAT64 domain. The IPv6 6to4 prefix (`2002::/16`, RFC 3056) is handled the same way as NAT64 rather than blocked outright — since 6to4 legitimately tunnels arbitrary public IPv4 traffic — by extracting the embedded 32-bit IPv4 address and re-validating it: a 6to4-wrapped private/loopback address (e.g. `2002:a00:1::`, embedding `10.0.0.1`) is blocked, while a 6to4-wrapped public address (e.g. `2002:808:808::`, embedding `8.8.8.8`) still passes through.
 - **DNS rebinding mitigation (pinned `lookup`).** Every hop resolves the destination hostname **once** via `dns.lookup`, validates the resolved address is public, then passes axios a per-request `httpAgent`/`httpsAgent` whose `lookup` function is pinned to that exact `{ address, family }` pair. The TCP socket is therefore guaranteed to connect to the IP the framework validated, rather than whatever the kernel resolver returns microseconds later. This closes the classic DNS-rebinding TOCTOU window where an attacker-controlled authoritative server answers the validation lookup with a public IP and the subsequent connect-time lookup with `127.0.0.1` / `169.254.169.254`. Each redirect hop re-resolves and re-pins so chained rebinding attempts are also defeated.
+- **No ambient egress proxy.** The outbound `axios.get` call sets `proxy: false` unconditionally, so a process-environment proxy (`HTTP_PROXY` / `HTTPS_PROXY` / lowercase variants) is never honored. Without this, an operator's ambient proxy setting could silently reopen the exact window the allowlist, public-IP validation, and DNS pinning above exist to close — an IP-literal proxy would connect the socket to a target that was never checked, and a hostname-literal proxy re-resolves at connect time through the proxy's own resolver, bypassing the pinned address entirely. Operators who need an egress proxy for this middleware's outbound fetches must front it at the network layer (e.g. a transparent proxy at the OS/container level) rather than via axios' env-var detection.
 
 ### Decompression-Bomb Protection
 
@@ -289,8 +295,9 @@ All local paths are validated to prevent directory traversal attacks:
 
 ### SVG Input Rejection
 
-- SVG inputs are rejected by default. The middleware uses a magic-byte sniffer that detects `<svg`, `<?xml ... <svg`, UTF-8 BOM-prefixed SVG, and comment-prefixed SVG, then bails to the fallback image before reaching libvips/librsvg.
-- This guards against XML bombs, billion-laughs attacks, and nested `<use>` exploits historically parsed during SVG decoding.
+- SVG inputs are rejected by default. The middleware uses a magic-byte sniffer that detects `<svg`, `<?xml ... <svg`, `<!DOCTYPE ... <svg` (including a UTF-8 BOM, UTF-16 BOM, or comment prefix ahead of any of these), then bails to the fallback image before reaching libvips/librsvg.
+- **DOCTYPE-prefixed SVG and entity-bomb DTDs.** A buffer carrying a `<!DOCTYPE svg …>` declaration — a common, spec-legal way to start an SVG document — is recognized even when a hostile internal DTD subset (a `<!DOCTYPE svg [ <!ENTITY … > … ]>` billion-laughs bomb) pads the document far enough that the literal `<svg` root tag falls outside the sniffer's 4 KiB inspection window: a prolog that names `svg` as the DOCTYPE's own root element is treated as conclusive on its own, independent of where the `<svg` tag itself lands. This holds whether the `<!DOCTYPE svg …>` opens the buffer directly OR sits behind an `<?xml …?>` declaration or `<!-- … -->` comment (the most common real-world SVG opening, `<?xml version="1.0"?>` then `<!DOCTYPE svg …>`), in both the latin1/UTF-8 and UTF-16 branches — so a bomb DTD cannot evade the sniffer by hiding behind an XML declaration or comment. The DOCTYPE-root check runs only on a buffer that already begins with a recognized XML prolog (`<svg`/`<?xml`/`<!--`/`<!doctype`), so it never inspects arbitrary raster bytes.
+- This guards against XML bombs, billion-laughs attacks, and nested `<use>` exploits historically parsed during SVG decoding. A second, independent check on Sharp's own `metadata().format === "svg"` result remains as defense-in-depth for any input the magic-byte sniffer doesn't catch.
 - Set `allowSvgInput: true` to opt in — only do so when the source pipeline is fully trusted.
 
 ### API Prefix and ReDoS Safety
@@ -348,19 +355,50 @@ const serveImage = registerServe({
 > after your callback returns so a buggy implementation cannot expand the
 > filesystem surface area beyond an opt-in root.
 
+### Response Header Hardening
+
+Every response carrying a body sets `X-Content-Type-Options: nosniff`, preventing a browser from MIME-sniffing the bytes away from the declared `Content-Type`. See [Content-Disposition, `Vary`, and `nosniff` Headers](#content-disposition-vary-and-nosniff-headers) below for the full detail, and [Fallback Response Caching](#fallback-response-caching) for how a placeholder response's `Cache-Control` and `ETag` are kept from being cached as if it were the real image.
+
 ## Caching
 
 ### Deterministic ETag (pre-Sharp short-circuit)
 
-When `etag: true` (the default), the middleware builds a SHA-1 ETag from a deterministic key combining `src`, `width`, `height`, `format`, `quality`, `type`, `folder`, the post-`idHandler` `userId`, and a source identifier (`mtimeMs:size` for local files, the resolved URL for remote sources). The key is computed **before** any Sharp work, so an `If-None-Match` request that hits a known ETag returns `304 Not Modified` immediately — no decode, no resize, no re-encode.
+When `etag: true` (the default), the middleware builds a SHA-256 ETag from a deterministic key combining `src`, `width`, `height`, `format`, `quality`, `type`, `folder`, the post-`idHandler` `userId`, and a source identifier. The key is computed **before** any Sharp work, so an `If-None-Match` request that hits a known ETag returns `304 Not Modified` immediately — no decode, no resize, no re-encode.
 
-When a deterministic key cannot be derived (e.g., the source file is missing and the pipeline falls back to a placeholder image), the framework computes a SHA-1 over the processed buffer instead, preserving the historical ETag contract for fallback responses.
+The source identifier is `file:<mtimeMs>:<size>` for a local file — **including** an `http(s)://` request `src` whose host resolves to the configured `websiteURL`, which is stat'd against its on-disk path the same way a direct local path is, so its ETag changes when the underlying file on disk changes rather than staying pinned to the immutable URL string forever. A genuinely external `http(s)://` source (not matching `websiteURL`) still identifies as `url:<src>`. A local file (direct or internal-URL-resolved) larger than `maxDownloadBytes` yields no deterministic identifier at all — it degrades to the buffer-hash form below, so the ETag always matches the fallback bytes actually served rather than the real, oversized file's stat.
 
-### Content-Disposition and `Vary` Header
+When a deterministic key cannot be derived (e.g., the source file is missing, an oversized local file as described above, or the pipeline otherwise falls back to a placeholder image), the framework computes a SHA-256 over the processed buffer instead, preserving the historical ETag contract for fallback responses. **This buffer-hash form is also what a "soft fallback" always uses** — see below.
 
-Responses include an RFC 6266 / RFC 5987 `Content-Disposition` header with **both** a quoted ASCII `filename=` parameter and a percent-encoded `filename*=UTF-8''<encoded>` parameter, so unicode filenames (Arabic, CJK, etc.) round-trip cleanly through clients and proxies. Query strings and fragments are stripped before the filename is derived, only-punctuation basenames fall back to `image`, and very long names are truncated so the response header stays bounded.
+### Fallback Response Caching
 
-Every successful response also carries `Vary: Accept-Encoding` for downstream cache correctness.
+A response that serves the bundled placeholder image — because the requested source is missing, invalid, blocked by the network allowlist, rejected by the SSRF guard, oversized, or transiently unreachable — is never cached under the same policy as a genuinely resolved image. This applies to both fallback shapes the middleware can serve:
+
+- A **soft fallback**: the placeholder still flows through Sharp and is re-encoded to the requested output format, on the ordinary `200` happy path.
+- A **hard fallback**: the outer pipeline catch serves the bundled asset verbatim after an unexpected failure (e.g., a Sharp decode error or an SVG rejection).
+
+Both shapes share the same `Cache-Control`:
+
+- `Cache-Control: public, max-age=60` — regardless of the operator's configured `cacheControl` value — instead of the long-lived success policy (`cacheControl` or the `public, max-age=86400, stale-while-revalidate=604800` default), so a transient failure cannot get cached as if it were permanent.
+
+ETag handling differs between the two shapes:
+
+- The **soft fallback** gets a **content-derived** (SHA-256 buffer-hash) `ETag`, never a source-derived one. Even a source that would otherwise resolve to a stable `url:<src>` or `file:<mtimeMs>:<size>` identifier has that identifier discarded the moment the response turns out to be a soft fallback, so the ETag always matches the placeholder bytes actually sent, not the source that failed to produce them.
+- The **hard fallback** sends no `ETag` at all — the outer-catch path serves the bundled asset verbatim without running the buffer-hash step, so the framework itself has nothing to key an ETag on for that response.
+
+This matters most for external sources: a client that cached a placeholder's ETag during an outage is **not** permanently stuck on it. Because the placeholder never carries the source's deterministic ETag, the client's next `If-None-Match` (or a fresh request once the 60-second cache window expires) reaches the pipeline again, and a since-recovered source is fetched and served fresh — a `200` with the real image, not a `304` that keeps replaying the placeholder.
+
+### `304 Not Modified` Validators
+
+Per [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#section-15.4.5), a server generating a `304` "SHOULD send" the same validators its `200` counterpart would have sent. Both `304` short-circuits — the pre-Sharp deterministic-ETag match and the post-Sharp buffer-hash-ETag match — echo `ETag`, `Cache-Control`, and `Vary: Accept-Encoding`:
+
+- The pre-Sharp `304` can only ever match a genuine deterministic ETag (a soft fallback always clears it, so no client can ever hold one for a placeholder), so its `Cache-Control` is unconditionally `cacheControl ?? DEFAULT_CACHE_CONTROL`.
+- The post-Sharp `304` uses the same fallback-aware `Cache-Control` the matching `200` would have used, so a repeat request for a still-missing source correctly keeps reporting the short `max-age=60` window instead of the long-lived default.
+
+### Content-Disposition, `Vary`, and `nosniff` Headers
+
+On the happy path and the soft fallback, responses include an RFC 6266 / RFC 5987 `Content-Disposition` header with **both** a quoted ASCII `filename=` parameter and a percent-encoded `filename*=UTF-8''<encoded>` parameter, so unicode filenames (Arabic, CJK, etc.) round-trip cleanly through clients and proxies. Query strings and fragments are stripped before the filename is derived, a basename that reduces to nothing after sanitization (empty, `/`, `\`, or composed solely of quote/backslash/control characters or non-ASCII bytes) falls back to `image`, and very long names are truncated so the response header stays bounded. The hard fallback instead sends a fixed `Content-Disposition: inline; filename="fallback.<ext>"` — a single ASCII parameter with no `filename*=` variant — since that path serves the bundled placeholder verbatim rather than deriving a filename from the request.
+
+Every response carrying a body — the happy path, the soft fallback, and the hard fallback — also carries `Vary: Accept-Encoding` for downstream cache correctness and `X-Content-Type-Options: nosniff`, the standard header that stops a browser from MIME-sniffing the body away from the declared `Content-Type`. The bodyless `304` responses don't need `nosniff` since there is no body to sniff.
 
 ## Observability
 
@@ -383,16 +421,17 @@ const serveImage = registerServe({
 });
 ```
 
-### `onComplete` — success + cache-hit pings
+### `onComplete` — success + cache-hit + fallback pings
 
-Fired after the response has been flushed on the happy path (200 with image bytes) **and** on the 304 cached short-circuit. The `cached` flag distinguishes the two paths, so a single hook can drive both latency histograms and cache-hit ratios:
+Fired after the response has been flushed on the happy path (200 with image bytes), on the 304 cached short-circuit, **and** on the hard-fallback path (a 200 serving the bundled placeholder verbatim after the outer pipeline catch) — every response that resolves to a 200 or a 304 fires this hook exactly once. The `cached` flag distinguishes 200s from 304s, and the `fallback` flag distinguishes a genuinely resolved-and-encoded image from a bundled placeholder, so a single hook can drive latency histograms, cache-hit ratios, and a "how often am I actually serving placeholders" gauge:
 
 ```typescript
 const serveImage = registerServe({
   baseDir: "/public/images",
   onComplete: (ctx) => {
     // ctx: { src?: string, userId?: string, format: ImageFormat,
-    //        outputBytes: number, cached: boolean, durationMs: number }
+    //        outputBytes: number, cached: boolean, durationMs: number,
+    //        fallback: boolean }
     metrics.histogram("pixel_serve.latency_ms", ctx.durationMs, {
       format: ctx.format,
       cached: String(ctx.cached),
@@ -404,18 +443,23 @@ const serveImage = registerServe({
       metrics.histogram("pixel_serve.output_bytes", ctx.outputBytes, {
         format: ctx.format,
       });
+      if (ctx.fallback) {
+        metrics.increment("pixel_serve.fallback_served", {
+          src: ctx.src ?? "unknown",
+        });
+      }
     }
   },
 });
 ```
 
-`durationMs` is captured via `process.hrtime.bigint()` for monotonic precision, so it is safe to feed directly into a latency histogram. `outputBytes` is the size of the response body in bytes (`0` for a 304, the encoded image size for a 200). `format` is the output format actually produced by the response — useful for slicing metrics by AVIF / WebP / JPEG.
+`durationMs` is captured via `process.hrtime.bigint()` for monotonic precision, so it is safe to feed directly into a latency histogram. `outputBytes` is the size of the response body in bytes (`0` for a 304, the encoded or placeholder image size for a 200). `format` is the output format actually produced by the response — useful for slicing metrics by AVIF / WebP / JPEG. `fallback` is `true` whenever the served bytes are the bundled placeholder rather than a genuinely resolved source — this covers both a "soft" fallback (e.g. a missing file or blocked host, still re-encoded through Sharp on a 200) and a "hard" fallback (any pipeline failure reaching the outer catch — whether before source resolution, like a schema/validation error, or after, like a Sharp encode failure — served verbatim); it is always `false` on a 304, since no bytes are sent that round-trip.
 
 Throws from either hook are swallowed.
 
 ## Error Handling
 
-Every catch site in the pipeline (Sharp, network fetch, filesystem read, `idHandler`, `getUserFolder`, schema, validation) serves a fallback image without exposing stack traces or system paths, then notifies `onError` if configured. The middleware itself never invokes Express's `next(error)` on the happy path.
+Every catch site in the pipeline (Sharp, network fetch, filesystem read, `idHandler`, `getUserFolder`, schema, validation) serves a fallback image without exposing stack traces or system paths, then notifies `onError` if configured. The middleware itself never invokes Express's `next(error)` on the happy path. When the outermost catch is the one that ends up serving the response (a "hard" fallback — any uncaught failure reaching it, whether before source resolution, like a schema/validation error, or after, like a Sharp encode error), the response is still a 200 and `onComplete` also fires for it, with `fallback: true`.
 
 There is one exception: if the response was already partially flushed (`res.headersSent === true`) at the moment the outer catch fires, the middleware cannot recover into a fresh fallback without tripping `ERR_HTTP_HEADERS_SENT`. In that case it surfaces an `Error("response already flushed")` via `next(err)` and fires `onError` with `phase: "fs"` so the connection is torn down cleanly. The current happy path only flushes via `res.send` at the very end of the pipeline, so this guard is defence-in-depth for future streaming refactors that may write headers earlier.
 
@@ -428,7 +472,7 @@ The current pipeline materializes intermediate buffers rather than streaming Sha
 ```text
 ~= source_buffer_size      (≤ maxDownloadBytes; default 5 MB)
  + processed_buffer_size   (decoded → resized → re-encoded output)
- + transient_etag_buffer   (SHA-1 over the processed buffer, fallback path only)
+ + transient_etag_buffer   (SHA-256 over the processed buffer, fallback path only)
 ```
 
 For most photo workloads the processed buffer is smaller than the source (re-encoding shrinks the payload), but pathological inputs (e.g., a 4 MB AVIF that decodes to a 50 MP raster which then re-encodes to a larger PNG) can push the high-water mark above twice the source size. Sharp decoding itself also requires a libvips work buffer proportional to `width × height × channels` outside the Node.js heap, which is bounded by `maxInputPixels` (default 256 MP).
@@ -445,7 +489,7 @@ Sharp's decode → rotate → resize → re-encode pipeline is CPU-bound and dom
 
 - **Use `cacheControl` aggressively.** Setting `Cache-Control: public, max-age=…, stale-while-revalidate=…` lets browsers and intermediate caches serve the image without ever round-tripping back to the middleware.
 - **Put a CDN in front.** Cloudflare, CloudFront, Fastly, etc. honor `Cache-Control` and `ETag` headers and can shield the origin from repeated processing entirely.
-- **Lean on the deterministic ETag short-circuit.** When `etag: true` (the default), the middleware computes a SHA-1 ETag from a stable cache key (`src` + `width` + `height` + `format` + `quality` + `type` + `folder` + post-`idHandler` `userId` + source identifier) **before** any Sharp work. An `If-None-Match` request that matches a known ETag returns `304 Not Modified` immediately — **no decode, no resize, no re-encode, no allocation of the processed buffer**. This is the cheapest possible response the middleware can produce and is the primary reason origin CPU stays bounded under repeated traffic for the same image variant.
+- **Lean on the deterministic ETag short-circuit.** When `etag: true` (the default), the middleware computes a SHA-256 ETag from a stable cache key (`src` + `width` + `height` + `format` + `quality` + `type` + `folder` + post-`idHandler` `userId` + source identifier) **before** any Sharp work. An `If-None-Match` request that matches a known ETag returns `304 Not Modified` immediately — **no decode, no resize, no re-encode, no allocation of the processed buffer**. This is the cheapest possible response the middleware can produce and is the primary reason origin CPU stays bounded under repeated traffic for the same image variant.
 
 > Streaming Sharp's output directly to `res` (instead of materializing the processed buffer) would further reduce the per-request high-water mark, but it is **not** currently supported — emitting a deterministic ETag requires either the buffer hash or the deterministic key, and the framework prefers the latter precisely because it preserves cacheability without forcing the full pipeline to run.
 
@@ -491,27 +535,28 @@ import { isValidPath } from "pixel-serve-server";
 
 ### Helpers
 
-Eleven additional helper functions are exported for downstream tooling — precomputing ETags for offline cache priming, sharing the SSRF/containment primitives with custom middleware, sniffing SVG inputs before they reach Sharp, and so on. They are part of the supported public API and have JSDoc + test coverage.
+Twelve additional helper functions are exported for downstream tooling — precomputing ETags for offline cache priming, sharing the SSRF/containment primitives with custom middleware, sniffing SVG inputs before they reach Sharp, and so on. They are part of the supported public API and have JSDoc + test coverage.
 
 **Security helpers (SSRF / containment)**
 
-- `isPrivateIp(address: string): boolean` — Returns `true` for any address in an IANA-reserved range that should never be reachable over the public internet (RFC 1918, loopback, link-local, unique-local, multicast, `0.0.0.0`, IPv4-mapped private IPv6, the AWS IMDS endpoint).
+- `isPrivateIp(address: string): boolean` — Returns `true` for an address in an IANA-reserved / non-public range: RFC 1918, loopback, link-local, unique-local, deprecated site-local `fec0::/10`, multicast, `0.0.0.0`, IPv4-mapped (`::ffff:`) and deprecated IPv4-compatible (`::a.b.c.d`) IPv6 embedding a non-public IPv4, the AWS IMDS endpoint, and NAT64-embedded private IPv4 (see the Security Features section above for the NAT64 well-known-prefix extraction vs. local-use-prefix blocking distinction). IPv6 addresses are classified from their fully-expanded numeric hextets, so the verdict is identical across every textual spelling of the same bare address (compressed, uncompressed, or with a dotted-quad IPv4 tail) — e.g. `::1` and `0:0:0:0:0:0:0:1` are both rejected. Any input the numeric parser cannot cleanly expand — including an RFC 4007 zone-id (`%scope`) suffix, which `net.isIP` still accepts as valid IPv6 — fails **closed** (returns `true`).
 - `isPublicHost(hostname: string): Promise<boolean>` — Resolves a hostname via `dns.lookup` and returns `true` only when the resolved address passes `isPrivateIp` rejection. Use this to gate any outbound request you build outside the middleware.
-- `resolvePinnedAddress(hostname: string): Promise<{ address: string, family: 4 | 6 }>` — Resolves a hostname once and returns the validated `{ address, family }` pair so a subsequent socket connection can be pinned to the exact IP the validator approved (DNS-rebinding mitigation).
-- `buildPinnedAgents(pinned: { address: string, family: 4 | 6 }): { httpAgent, httpsAgent }` — Builds `http.Agent` and `https.Agent` instances whose `lookup` function is pinned to the supplied `{ address, family }`. Drop them into axios / fetch to guarantee the TCP socket connects to the validated IP.
+- `resolvePinnedAddress(hostname: string): Promise<{ address: string, family: 4 | 6 } | null>` — Resolves a hostname once and returns the validated `{ address, family }` pair so a subsequent socket connection can be pinned to the exact IP the validator approved (DNS-rebinding mitigation). Returns `null` when the host is empty, resolves to no addresses, resolves to (or is) a private/loopback/link-local IP, or DNS resolution fails.
+- `buildPinnedAgents(address: string, family: 4 | 6): { httpAgent, httpsAgent }` — Builds `http.Agent` and `https.Agent` instances whose `lookup` function is pinned to the supplied `address`/`family` (both also passed directly to the agents' own `family`/`autoSelectFamily: false` options as defense in depth). Drop them into axios / fetch to guarantee the TCP socket connects to the validated IP.
 - `isInsideRoot(rootDir: string, candidatePath: string): Promise<boolean>` — Realpath-resolves both inputs and returns `true` only when `candidatePath` is a descendant of `rootDir`. Useful for custom containment checks around private-folder logic.
 - `resolveRootDir(rootDir: string): Promise<string>` — Realpath-resolves a configured root directory once; returns the canonical absolute path you should compare against in subsequent containment checks.
-- `looksLikeSvg(buffer: Buffer): boolean` — Magic-byte sniffer for SVG inputs (handles `<svg`, `<?xml … <svg`, UTF-8 BOM-prefixed, and comment-prefixed payloads). Returns `true` when libvips/librsvg would attempt to decode the buffer as SVG.
+- `looksLikeSvg(buffer: Buffer): boolean` — Magic-byte sniffer for SVG inputs (handles `<svg`, `<?xml … <svg`, `<!DOCTYPE … <svg` — including a DOCTYPE naming `svg` as its own root element, which is treated as conclusive even when an oversized entity-bomb DTD pushes the `<svg` tag itself out of the inspection window — each optionally UTF-8 BOM-, UTF-16 BOM-, or comment-prefixed). Returns `true` when libvips/librsvg would attempt to decode the buffer as SVG.
 
 **ETag / source-identifier helpers**
 
-- `buildSourceIdentifier(absolutePath?: string, url?: string): Promise<string | null>` — Builds the deterministic source fingerprint used inside the ETag key: `mtimeMs:size` for a local file (`fs.stat`) or the resolved URL string for a remote source. Returns `null` when no stable identifier can be derived.
-- `buildDeterministicEtag(parts: { src, width, height, format, quality, type, folder, userId?, sourceIdentifier }): string` — Computes the SHA-1 ETag used by the middleware **before** any Sharp work runs. Same inputs produce the same ETag, so you can pre-warm a CDN or short-circuit an `If-None-Match` request without invoking the full pipeline.
+- `buildSourceIdentifier(src: string | undefined, baseDir: string, options?: { websiteURL?: string; apiRegex?: RegExp; apiPrefix?: string; maxBytes?: number }): Promise<string | null>` — Builds the deterministic source fingerprint used inside the ETag key: `file:<mtimeMs>:<size>` for a local file (`fs.stat`, gated behind `isValidPath` so an out-of-tree/traversal `src` returns `null`). When `options.websiteURL` is supplied and `src` is an `http(s)://` URL resolving to that host (via `resolveInternalLocalPath`, below), it is treated the same as a local file — stat'd against its on-disk path — so its ETag changes when the file changes rather than staying pinned to the immutable URL string; a genuinely external URL still returns the `url:<src>` string form. Returns `null` (degrading the caller to the buffer-hash ETag) when no stable identifier can be derived, or when `options.maxBytes` is set and the resolved local file's size exceeds it. The `options` argument is optional and additive — existing `(src, baseDir)` call sites are unaffected.
+- `buildDeterministicEtag(fields: { src, width, height, format, quality, type, folder, parsedUserId }, sourceIdentifier: string): string` — Computes the SHA-256 ETag used by the middleware **before** any Sharp work runs. Same inputs produce the same ETag, so you can pre-warm a CDN or short-circuit an `If-None-Match` request without invoking the full pipeline.
 
 **Path / API helpers**
 
-- `stripApiPrefix(pathname: string, options: { apiPrefix?: string, apiRegex?: RegExp }): string` — Strips the configured API prefix from a URL pathname using the same precedence rules as the middleware (`apiPrefix` literal `startsWith` wins over `apiRegex`).
-- `buildFilename(src: string, format: ImageFormat): { asciiFilename, encodedFilename }` — Builds the dual `filename=` / `filename*=UTF-8''…` pair used in `Content-Disposition`. Handles RFC 5987 percent-encoding, truncation that respects `%XX` boundaries, and the empty/punctuation-only basename fallback to `image`.
+- `stripApiPrefix(pathname: string, apiRegex: RegExp, apiPrefix: string | undefined): string` — Strips the configured API prefix from a URL pathname using the same precedence rules as the middleware (`apiPrefix` literal `startsWith` wins over `apiRegex`; when `apiPrefix` is `undefined` the `apiRegex` is applied instead).
+- `resolveInternalLocalPath(src: string, websiteURL: string | undefined, apiRegex: RegExp, apiPrefix: string | undefined): string | null` — Determines whether `src` is an `http(s)://` URL whose host matches the normalized `websiteURL` (bare hostname, `host:port`, or full URL — including the `www.` variant), and if so returns its API-prefix-stripped local pathname (via `stripApiPrefix`); returns `null` for a non-URL `src`, a parse failure, or a genuinely external host. This is the shared primitive behind both `fetchImage`'s internal-host routing and `buildSourceIdentifier`'s ETag correctness above, so the two cannot drift apart.
+- `buildFilename(src: string, format: ImageFormat): { asciiFilename, encodedFilename }` — Builds the dual `filename=` / `filename*=UTF-8''…` pair used in `Content-Disposition`. Handles RFC 5987 percent-encoding, truncation that respects `%XX` boundaries, and the fallback to `image` for a basename that reduces to nothing after sanitization.
 
 ```typescript
 import {
@@ -525,6 +570,7 @@ import {
   buildSourceIdentifier,
   buildDeterministicEtag,
   stripApiPrefix,
+  resolveInternalLocalPath,
   buildFilename,
 } from "pixel-serve-server";
 ```

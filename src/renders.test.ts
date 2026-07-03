@@ -207,8 +207,12 @@ describe("renderUserData", () => {
     expect(result.height).toBe(1000); // Clamped to customBounds.maxHeight
   });
 
-  it("uses schema default quality when not provided in input", () => {
-    // Schema has default quality of 80, which takes precedence
+  it("falls back to bounds.defaultQuality when not provided in input", () => {
+    // Phase 5: the schema no longer defaults quality, so this exercises
+    // the `parsed.quality ?? bounds.defaultQuality` fallback directly.
+    // defaultBounds.defaultQuality is 80, so the observed value is
+    // unchanged from before the fix — see "defaultQuality actually
+    // governs" below for a bounds value other than 80.
     const result = renderUserData({}, defaultBounds);
     expect(result.quality).toBe(80);
   });
@@ -260,28 +264,44 @@ describe("renderUserData", () => {
     });
 
     it("falls back to bounds.defaultQuality when caller omits quality entirely", () => {
-      // Schema default fires first (80); if the caller explicitly omits it,
-      // the bounds.defaultQuality is only used when the schema default has
-      // been replaced. Documenting current behavior: omitted quality yields
-      // the schema default (80), NOT bounds.defaultQuality (70).
+      // Phase 5: the schema no longer defaults quality to 80, so an omitted
+      // quality reaches renderUserData as `undefined` and
+      // `parsed.quality ?? bounds.defaultQuality` now actually governs —
+      // omitted quality yields bounds.defaultQuality (70), NOT a
+      // hard-coded 80.
       const customBounds = { ...defaultBounds, defaultQuality: 70 };
       const result = renderUserData({}, customBounds);
-      expect(result.quality).toBe(80);
+      expect(result.quality).toBe(70);
     });
 
     it("uses bounds.defaultQuality when schema-parsed quality is undefined", () => {
       // Direct exercise of the `quality ?? bounds.defaultQuality` fallback.
-      // The schema chain assigns a default of 80 when no quality is given,
-      // so the bounds.defaultQuality is only used as a SECOND-tier fallback
-      // when the schema explicitly produces undefined — which today happens
-      // only through schema redesign. Pinning the runtime behavior here so
-      // a future change is caught.
+      // Phase 5 dropped the schema's own `.default(80)`, so
+      // bounds.defaultQuality is now the ONLY source of a default quality
+      // when the request omits it — pinning the runtime behavior here so a
+      // future regression (e.g. re-adding a schema default) is caught.
       const customBounds = { ...defaultBounds, defaultQuality: 55 };
-      // quality=80 is the documented default; bounds.defaultQuality has no
-      // effect when the user does not supply quality.
       const result = renderUserData({}, customBounds);
+      expect(result.quality).toBe(55);
+      expect(result.quality).toBe(customBounds.defaultQuality);
+    });
+  });
+
+  describe("defaultQuality actually governs when quality is omitted (Phase 5)", () => {
+    it("honors a non-80 defaultQuality (60) when the request omits quality", () => {
+      const result = renderUserData(
+        {},
+        { ...defaultBounds, defaultQuality: 60 },
+      );
+      expect(result.quality).toBe(60);
+    });
+
+    it("still yields 80 when defaultQuality is 80 (the operator default)", () => {
+      const result = renderUserData(
+        {},
+        { ...defaultBounds, defaultQuality: 80 },
+      );
       expect(result.quality).toBe(80);
-      expect(result.quality).not.toBe(customBounds.defaultQuality);
     });
   });
 });

@@ -73,13 +73,19 @@ export const userDataSchema = z
           .max(4000, "height too large")
           .optional(),
       ),
+    // No `.default(80)` here (Phase 5): a hard-coded schema default always
+    // won, so `renderUserData`'s `parsed.quality ?? bounds.defaultQuality`
+    // fallback could never fire and the documented `defaultQuality` option
+    // was dead code. Leaving `quality` genuinely optional lets that fallback
+    // govern; `optionsSchema.defaultQuality`'s own `.default(80)` keeps the
+    // effective middleware default unchanged.
     quality: z
       .union([z.number(), z.string()])
       .optional()
       .transform((value) =>
         value === undefined || value === null ? undefined : Number(value),
       )
-      .pipe(z.number().int().min(1).max(100).default(80)),
+      .pipe(z.number().int().min(1).max(100).optional()),
     folder: z.enum(["public", "private"]).default("public"),
     type: imageTypeEnum.default("normal"),
     userId: z
@@ -203,6 +209,23 @@ export const optionsSchema = z
   .refine((data) => data.minHeight <= data.maxHeight, {
     message: "minHeight must be less than or equal to maxHeight",
     path: ["minHeight"],
+  })
+  // userDataSchema hard-rejects any request width/height outside [50, 4000]
+  // (see below) before renderUserData's clamp() ever runs, so an operator
+  // minWidth/maxWidth/minHeight/maxHeight configured outside that window is
+  // silently non-functional for the out-of-window portion of its range —
+  // e.g. minWidth: 10 can never rescue a width:20 request, since the schema
+  // throws "width too small" first. Fail loudly at registerServe() time
+  // instead of shipping a config that quietly does nothing.
+  .refine((data) => data.minWidth >= 50 && data.maxWidth <= 4000, {
+    message:
+      "minWidth and maxWidth must lie within the framework's hard [50, 4000] dimension window",
+    path: ["maxWidth"],
+  })
+  .refine((data) => data.minHeight >= 50 && data.maxHeight <= 4000, {
+    message:
+      "minHeight and maxHeight must lie within the framework's hard [50, 4000] dimension window",
+    path: ["maxHeight"],
   });
 
 export type ParsedUserData = z.infer<typeof userDataSchema>;
