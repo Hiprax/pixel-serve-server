@@ -31,6 +31,16 @@ vi.mock("node:dns/promises", () => ({
 
 import * as dns from "node:dns/promises";
 
+// Partial passthrough mock so an individual test can `vi.spyOn(fsp, "…")` to
+// simulate a TOCTOU failure while every other test keeps hitting the real
+// filesystem (asset reads, temp dirs) untouched. Mirrors functions.test.ts.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual };
+});
+
+import * as fsp from "node:fs/promises";
+
 // dns.lookup is multi-overloaded; production code uses `{ all: true }` so it
 // resolves to `LookupAddress[]`. The default `mocked()` typing picks the
 // single-address overload, so we route through a typed helper.
@@ -1885,6 +1895,36 @@ describe("deterministic ETag (Task 6)", () => {
     expect(sid).toMatch(/^file:\d+(?:\.\d+)?:\d+$/);
   });
 
+  it("buildSourceIdentifier returns null when fs.stat rejects AFTER isValidPath passed (TOCTOU race)", async () => {
+    // isValidPath performs two real fs.stat calls (base dir, then resolved
+    // file) before returning true; buildSourceIdentifier then performs a
+    // THIRD, independent fs.stat on the same file. In production that third
+    // call can only fail via a genuine TOCTOU race — reproduced here by
+    // letting the first two (real) stats succeed and rejecting the third,
+    // driving the catch that degrades the ETag to the buffer hash.
+    let statCalls = 0;
+    const realStat = fsp.stat;
+    const statSpy = vi.spyOn(fsp, "stat").mockImplementation(((
+      ...args: unknown[]
+    ): Promise<unknown> => {
+      statCalls++;
+      if (statCalls > 2) {
+        return Promise.reject(new Error("simulated ENOENT after isValidPath"));
+      }
+      return (realStat as unknown as (...a: unknown[]) => Promise<unknown>)(
+        ...args,
+      );
+    }) as typeof fsp.stat);
+
+    try {
+      const id = await buildSourceIdentifier("noimage.jpg", assetDir);
+      expect(id).toBeNull();
+      expect(statCalls).toBeGreaterThan(2);
+    } finally {
+      statSpy.mockRestore();
+    }
+  });
+
   it("falls back to buffer-hash ETag when no deterministic source identifier is available", async () => {
     // Use a missing src so readLocalImage returns the fallback. Source
     // identifier is null, so the pipeline must still produce an ETag from
@@ -2242,6 +2282,18 @@ describe("Content-Disposition hardening (Task 7)", () => {
     // must still collapse cleanly.
     const wrapped = buildFilename("photo", "jpeg");
     expect(wrapped.asciiFilename).toBe("photo.jpeg");
+  });
+
+  it("buildFilename percent-encodes RFC 5987 chars encodeURIComponent leaves bare ( ' ( ) * )", () => {
+    // encodeURIComponent does NOT escape ' ( ) * ; the extra
+    // .replace(/['()*]/g, …) re-encodes them so none can prematurely
+    // terminate the quoted filename* parameter. Without a filename carrying
+    // one of these characters, that replace callback is never exercised.
+    const r = buildFilename("a'(b)*c.jpg", "jpeg");
+    expect(r.encodedFilename).toBe("a%27%28b%29%2Ac.jpeg");
+    // ' ( ) * are printable, non-quote ASCII, so the filename= (ascii) form
+    // keeps them verbatim.
+    expect(r.asciiFilename).toBe("a'(b)*c.jpeg");
   });
 
   it("buildFilename does not truncate mid-percent-encoded byte for long CJK names (Task 5)", () => {
@@ -3818,6 +3870,34 @@ describe("isInsideRoot preResolvedRoot parameter (Phase 6 Task 6.2 direct unit c
     } finally {
       await fsmod.rm(root, { recursive: true, force: true });
       await fsmod.rm(other, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to a lexical resolve when rootDir's realpath fails (non-existent root, no preResolvedRoot)", async () => {
+    // Every middleware request supplies a preResolvedRoot (the factory caches
+    // it at startup), so the self-resolve branch's realpath-failure catch is
+    // only reachable by calling isInsideRoot directly with a rootDir that does
+    // not exist on disk AND no preResolvedRoot. The catch falls back to the
+    // lexical path.resolve so a not-yet-created containment root can still be
+    // evaluated: a descendant is contained, a sibling is not.
+    const fsmod = await import("node:fs/promises");
+    const osmod = await import("node:os");
+    const parent = await fsmod.mkdtemp(
+      path.join(osmod.tmpdir(), "pixel-serve-noroot-"),
+    );
+    try {
+      const missingRoot = path.join(parent, "not-created-yet");
+      expect(
+        await isInsideRoot(
+          missingRoot,
+          path.join(missingRoot, "user", "a.jpg"),
+        ),
+      ).toBe(true);
+      expect(
+        await isInsideRoot(missingRoot, path.join(parent, "elsewhere.jpg")),
+      ).toBe(false);
+    } finally {
+      await fsmod.rm(parent, { recursive: true, force: true });
     }
   });
 });
