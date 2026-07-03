@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as dns from "node:dns/promises";
 import * as http from "node:http";
 import * as https from "node:https";
-import { isIP } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
 import axios, { AxiosError, AxiosResponse } from "axios";
 import { FALLBACKIMAGES, mimeTypes } from "./variables";
 import type { ImageType, PixelServeOnError } from "./types";
@@ -127,6 +127,74 @@ export const isValidPath = async (
 };
 
 /**
+ * A fully-expanded IPv6 address: its 8 constituent 16-bit hextets, in order.
+ */
+type Hextets = [number, number, number, number, number, number, number, number];
+
+/**
+ * Expands any syntactically valid IPv6 literal (already confirmed via
+ * `isIP(ip) === 6`) into its 8 constituent hextets. Handles `::` zero-run
+ * compression at any position and the optional trailing IPv4 dotted-quad
+ * tail (RFC 4291 §2.2 item 3, e.g. `"64:ff9b::192.0.2.1"`).
+ *
+ * Used so NAT64 prefix detection below is a numeric comparison rather than
+ * a `startsWith("64:ff9b::")` string match, which would miss a fully
+ * expanded or partially compressed equivalent representing the exact same
+ * address — a real bypass vector for an attacker-supplied IP literal that
+ * never goes through DNS. Returns `null` if the (already-validated) string
+ * does not decompose into exactly 8 hextets, which should not happen in
+ * practice given the `isIP` precondition.
+ */
+const expandIPv6Hextets = (ip: string): Hextets | null => {
+  let body = ip;
+  const lastColon = body.lastIndexOf(":");
+  const tail = lastColon >= 0 ? body.slice(lastColon + 1) : body;
+  if (isIP(tail) === 4) {
+    const octets = tail.split(".").map(Number);
+    const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
+    const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
+    body = body.slice(0, lastColon + 1) + hi + ":" + lo;
+  }
+
+  const halves = body.split("::");
+  if (halves.length > 2) return null;
+
+  // Parse a colon-separated run of hextets, failing closed (returning null) on
+  // any group that is not a clean 1-4 digit hex value. Without this validation
+  // `parseInt` would silently truncate a malformed group — e.g. an RFC 4007
+  // zone-id suffix leaves the tail "127.0.0.1%eth0", which `parseInt(_, 16)`
+  // collapses to `0x127` — producing a plausible-but-wrong tuple that shifts
+  // the classifier's markers out of position and could report a private
+  // address as public. `net.isIP` accepts a zone-id'd literal as valid IPv6,
+  // so this parser must reject anything that is not a bare address explicitly.
+  const parseGroup = (s: string): number[] | null => {
+    if (s === "") return [];
+    const out: number[] = [];
+    for (const h of s.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/i.test(h)) return null;
+      out.push(parseInt(h, 16));
+    }
+    return out;
+  };
+
+  let hextets: number[];
+  if (halves.length === 1) {
+    const only = parseGroup(halves[0]!);
+    if (only === null) return null;
+    hextets = only;
+  } else {
+    const left = parseGroup(halves[0]!);
+    const right = parseGroup(halves[1]!);
+    if (left === null || right === null) return null;
+    const missing = 8 - left.length - right.length;
+    if (missing < 0) return null;
+    hextets = [...left, ...Array<number>(missing).fill(0), ...right];
+  }
+
+  return hextets.length === 8 ? (hextets as Hextets) : null;
+};
+
+/**
  * Determines if an IP address (v4 or v6) is private, loopback, link-local,
  * unique-local, multicast, broadcast, or otherwise unsafe to issue requests to.
  *
@@ -145,6 +213,8 @@ export const isPrivateIp = (ip: string): boolean => {
     if (a === 0) return true;
     // 10.0.0.0/8
     if (a === 10) return true;
+    // 100.64.0.0/10 RFC 6598 shared address space (CGNAT, cloud-internal)
+    if (a === 100 && b >= 64 && b <= 127) return true;
     // 127.0.0.0/8 (loopback)
     if (a === 127) return true;
     // 169.254.0.0/16 (link-local, AWS IMDS)
@@ -155,6 +225,8 @@ export const isPrivateIp = (ip: string): boolean => {
     if (a === 192 && b === 168) return true;
     // 192.0.0.0/24 (IETF Protocol Assignments) and 192.0.2.0/24 (TEST-NET-1)
     if (a === 192 && b === 0) return true;
+    // 192.88.99.0/24 RFC 3068 6to4 anycast relay (deprecated)
+    if (a === 192 && b === 88 && parts[2] === 99) return true;
     // 198.18.0.0/15 (benchmarking)
     if (a === 198 && (b === 18 || b === 19)) return true;
     // 198.51.100.0/24 (TEST-NET-2)
@@ -168,24 +240,79 @@ export const isPrivateIp = (ip: string): boolean => {
     return false;
   }
 
-  // IPv6 — normalize lowercase
-  const lower = ip.toLowerCase();
-  // unspecified ::
-  if (lower === "::" || lower === "::0") return true;
-  // loopback ::1
-  if (lower === "::1") return true;
-  // IPv4-mapped (::ffff:a.b.c.d) — any malformed v4 tail is treated as unsafe
-  if (lower.startsWith("::ffff:")) {
-    const v4 = lower.slice("::ffff:".length);
-    if (isIP(v4) === 4) return isPrivateIp(v4);
-    return true;
+  // IPv6 — classify from the fully-expanded numeric hextets rather than from
+  // textual prefixes. Textual matching was unsound in BOTH directions: in the
+  // "allow" direction the loopback ::1 written uncompressed ("0:0:0:0:0:0:0:1"),
+  // the unspecified :: written uncompressed, and an uncompressed IPv4-mapped
+  // address ("0:0:0:0:0:ffff:7f00:1") all slipped past the exact-string /
+  // `startsWith` checks and were wrongly treated as public — an SSRF bypass in
+  // the exported `isPrivateIp` guard and in the DNS-validation path, since a
+  // resolver or a caller can legitimately hand us an uncompressed literal; in
+  // the "block" direction "fe8:…" (numeric 0x0fe8 — unrelated reserved space,
+  // not link-local) matched the old fe80::/10 regex. Expanding to the 8 numeric
+  // hextets first (via `expandIPv6Hextets`, which also folds a trailing
+  // dotted-quad IPv4 tail) makes every textual representation of the same
+  // address classify identically. `isIP(ip) === 6` guarantees a parse; fail
+  // closed (treat as unsafe) on the defensive `null` branch.
+  const hextets = expandIPv6Hextets(ip.toLowerCase());
+  if (!hextets) return true;
+  const [h0, h1, h2, h3, h4, h5, h6, h7] = hextets;
+  const embeddedV4 = (hi: number, lo: number): string =>
+    `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+  const highBitsZero = h0 === 0 && h1 === 0 && h2 === 0 && h3 === 0 && h4 === 0;
+
+  // ::/96 low block — the unspecified address (::), loopback (::1), and the
+  // deprecated IPv4-compatible ::a.b.c.d form (RFC 4291 §2.5.5.1, "MUST NOT be
+  // assigned to any node"). Classify by the embedded low-32-bit IPv4: :: maps
+  // to 0.0.0.0 and ::1 to 0.0.0.1 (both in the blocked 0.0.0.0/8 range), and an
+  // embedded private/loopback/link-local v4 (e.g. ::127.0.0.1, ::10.0.0.1,
+  // ::169.254.169.254) is blocked, while an embedded — deprecated, non-routable
+  // — public v4 passes through, mirroring the ::ffff: and NAT64 /96 branches.
+  if (highBitsZero && h5 === 0) return isPrivateIp(embeddedV4(h6, h7));
+  // IPv4-mapped ::ffff:a.b.c.d (RFC 4291) — recurse on the embedded IPv4 so a
+  // mapped private/loopback v4 is blocked while a mapped public v4 passes.
+  if (highBitsZero && h5 === 0xffff) return isPrivateIp(embeddedV4(h6, h7));
+  // NAT64 (RFC 6052 / RFC 8215) — addresses that embed an IPv4 address.
+  if (h0 === 0x64 && h1 === 0xff9b) {
+    if (h2 === 0 && h3 === 0 && h4 === 0 && h5 === 0) {
+      // 64:ff9b::/96 (RFC 6052 Well-Known Prefix) — the embedded IPv4
+      // occupies the low 32 bits contiguously. Recurse so a NAT64-wrapped
+      // private v4 is blocked while a NAT64-wrapped public v4 passes.
+      return isPrivateIp(embeddedV4(h6, h7));
+    }
+    if (h2 === 1) {
+      // 64:ff9b:1::/48 (RFC 8215 Local-Use Prefix) — intentionally NOT
+      // unwrapped. RFC 8215 explicitly exempts this prefix from the
+      // Well-Known Prefix's "embedded address must be public" restriction
+      // (it may legitimately carry private IPv4 addresses) and it exists
+      // only for an operator's own limited/local NAT64 domain — a
+      // general-purpose fetch middleware has no legitimate reason to ever
+      // see it in the wild. Its embedded IPv4 is also split
+      // non-contiguously around a reserved zero octet at different bit
+      // offsets than the /96 form (RFC 6052 §2.2), so a hand-rolled
+      // extraction here would be new, untested, security-critical
+      // bit-splicing logic. Two independent judge reviews converged on
+      // blocking the whole range rather than risk a subtly wrong decode
+      // silently opening an SSRF bypass.
+      return true;
+    }
   }
-  // link-local fe80::/10
-  if (/^fe[89ab][0-9a-f]?:/i.test(lower)) return true;
-  // unique-local fc00::/7
-  if (/^f[cd][0-9a-f]{0,2}:/i.test(lower)) return true;
-  // multicast ff00::/8
-  if (lower.startsWith("ff")) return true;
+  // 6to4 2002::/16 (RFC 3056) — embeds a 32-bit IPv4 address in h1:h2
+  // (`2002:<hi>:<lo>::/48`). Unlike the NAT64 well-known prefix above, 6to4
+  // legitimately tunnels arbitrary *public* IPv4 traffic, so — mirroring the
+  // NAT64 /96 handling — unwrap the embedded address and recurse rather than
+  // blocking the whole range outright: a 6to4-wrapped private/loopback v4
+  // (e.g. 2002:a00:1:: embedding 10.0.0.1) is blocked, while a 6to4-wrapped
+  // public v4 (e.g. 2002:808:808:: embedding 8.8.8.8) still passes.
+  if (h0 === 0x2002) return isPrivateIp(embeddedV4(h1, h2));
+  // link-local fe80::/10 (0xfe80–0xfebf)
+  if (h0 >= 0xfe80 && h0 <= 0xfebf) return true;
+  // deprecated site-local fec0::/10 (0xfec0–0xfeff, RFC 3879)
+  if (h0 >= 0xfec0 && h0 <= 0xfeff) return true;
+  // unique-local fc00::/7 (0xfc00–0xfdff)
+  if (h0 >= 0xfc00 && h0 <= 0xfdff) return true;
+  // multicast ff00::/8 (0xff00–0xffff)
+  if (h0 >= 0xff00 && h0 <= 0xffff) return true;
   return false;
 };
 
@@ -250,28 +377,39 @@ export const resolvePinnedAddress = async (
 };
 
 /**
- * Internal type for the Node `lookup` callback shape we override below.
- * Exported only for tests; real consumers should not depend on it.
+ * Internal alias for Node's own `lookup` callback shape
+ * (`net.LookupFunction`), used by `http.Agent`/`https.Agent`'s `lookup`
+ * option. Node invokes this with a `{ all: true }` options object —
+ * expecting `callback(err, LookupAddress[])` — whenever `autoSelectFamily`
+ * is enabled (the default on Node >=20) and no `family` is pinned on the
+ * connect options; otherwise it uses the legacy single-address
+ * `callback(err, address, family)` form. `buildPinnedLookup` below must
+ * therefore handle both callback shapes. Module-private; tests reach the
+ * built function indirectly via the constructed agent's `options.lookup`.
  */
-type PinnedLookup = (
-  hostname: string,
-  options: unknown,
-  callback: (
-    err: NodeJS.ErrnoException | null,
-    address: string,
-    family: number,
-  ) => void,
-) => void;
+type PinnedLookup = LookupFunction;
 
 /**
  * Builds a pinned `lookup` function that always resolves to the same
  * `{ address, family }` pair. Used by `buildPinnedAgents` to force axios to
  * connect to the pre-validated IP rather than re-resolving the hostname.
+ *
+ * Handles both calling conventions Node uses for an Agent's pinned `lookup`:
+ * the `{ all: true }` shape (the default on Node >=20, since
+ * `net.getDefaultAutoSelectFamily()` is `true` and no `family` is pinned on
+ * the connect options) expects `callback(err, [{ address, family }])`; the
+ * legacy single-address `callback(err, address, family)` form is used
+ * otherwise. Without this, `net` receives `undefined` from the single-address
+ * form and the socket connect throws `ERR_INVALID_IP_ADDRESS`.
  */
 const buildPinnedLookup =
   (address: string, family: 4 | 6): PinnedLookup =>
-  (_hostname, _options, callback): void => {
-    callback(null, address, family);
+  (_hostname, options, callback): void => {
+    if (options?.all) {
+      callback(null, [{ address, family }]);
+    } else {
+      callback(null, address, family);
+    }
   };
 
 /**
@@ -287,6 +425,12 @@ const buildPinnedLookup =
  * not reused across requests so the pinning lifetime matches the redirect
  * loop hop that validated the IP. Agents are not explicitly `destroy()`-ed
  * because Node garbage-collects unused agents once their sockets close.
+ *
+ * `family` and `autoSelectFamily: false` are also passed directly to both
+ * agents as defense in depth: even if a future Node change alters how/when
+ * `lookup` is invoked, pinning `family` and disabling Happy Eyeballs
+ * (`autoSelectFamily`) keeps the socket connect from second-guessing the
+ * validated address.
  */
 export const buildPinnedAgents = (
   address: string,
@@ -294,8 +438,8 @@ export const buildPinnedAgents = (
 ): { httpAgent: http.Agent; httpsAgent: https.Agent } => {
   const lookup = buildPinnedLookup(address, family);
   return {
-    httpAgent: new http.Agent({ lookup }),
-    httpsAgent: new https.Agent({ lookup }),
+    httpAgent: new http.Agent({ lookup, family, autoSelectFamily: false }),
+    httpsAgent: new https.Agent({ lookup, family, autoSelectFamily: false }),
   };
 };
 
@@ -328,6 +472,18 @@ const requestNoRedirect = async (
       maxRedirects: 0,
       httpAgent: agents.httpAgent,
       httpsAgent: agents.httpsAgent,
+      // Disable axios' ambient HTTP(S)_PROXY / http(s)_proxy env-var proxy
+      // detection. The allowlist + public-IP validation + DNS pinning above
+      // are this request's entire security boundary, and an operator-machine
+      // env proxy would silently defeat all three: an IP-literal proxy
+      // connects the socket to a target we never validated, and a
+      // hostname-literal proxy re-resolves at connect time through the
+      // proxy's own resolver, undoing the pinned `lookup` that closes the
+      // DNS-rebinding window. `proxy: false` is axios' own documented
+      // mitigation for exactly this (see axios THREATMODEL.md "Proxy
+      // environment variable hijack"). An operator who needs an egress proxy
+      // must front this middleware with one at the network layer instead.
+      proxy: false,
       validateStatus: (status) =>
         (status >= 200 && status < 300) || (status >= 300 && status < 400),
     });
@@ -358,14 +514,26 @@ const fetchFromNetwork = async (
     allowedNetworkList,
     maxRedirects,
     onError,
+    onFallback,
   }: {
     timeoutMs: number;
     maxBytes: number;
     allowedNetworkList: string[];
     maxRedirects: number;
     onError?: PixelServeOnError;
+    /**
+     * Optional callback fired whenever this call resolves to the bundled
+     * `FALLBACKIMAGES[type]()` placeholder rather than genuinely-fetched
+     * bytes (blocked host, SSRF-reject, non-2xx, disallowed MIME, transport
+     * failure, etc.). Trailing and optional — backward-compatible.
+     */
+    onFallback?: () => void;
   },
 ): Promise<Buffer> => {
+  const fallback = async (): Promise<Buffer> => {
+    onFallback?.();
+    return FALLBACKIMAGES[type]();
+  };
   try {
     let currentUrl = src;
     for (let hop = 0; hop <= maxRedirects; hop++) {
@@ -374,7 +542,7 @@ const fetchFromNetwork = async (
         parsed = new URL(currentUrl);
       } catch (err) {
         safeOnError(onError, err, "fetch", currentUrl);
-        return await FALLBACKIMAGES[type]();
+        return await fallback();
       }
       if (!["http:", "https:"].includes(parsed.protocol)) {
         safeOnError(
@@ -383,7 +551,7 @@ const fetchFromNetwork = async (
           "fetch",
           currentUrl,
         );
-        return await FALLBACKIMAGES[type]();
+        return await fallback();
       }
       if (!isHostAllowed(parsed.hostname, parsed.host, allowedNetworkList)) {
         safeOnError(
@@ -392,7 +560,7 @@ const fetchFromNetwork = async (
           "fetch",
           currentUrl,
         );
-        return await FALLBACKIMAGES[type]();
+        return await fallback();
       }
       // Resolve once and pin the address into the http(s) agent's `lookup`
       // function so axios connects to the IP we validated, NOT whatever the
@@ -410,7 +578,7 @@ const fetchFromNetwork = async (
           "fetch",
           currentUrl,
         );
-        return await FALLBACKIMAGES[type]();
+        return await fallback();
       }
 
       const agents = buildPinnedAgents(pinned.address, pinned.family);
@@ -427,7 +595,7 @@ const fetchFromNetwork = async (
           "fetch",
           currentUrl,
         );
-        return await FALLBACKIMAGES[type]();
+        return await fallback();
       }
 
       if (response.status >= 300 && response.status < 400) {
@@ -439,14 +607,14 @@ const fetchFromNetwork = async (
             "fetch",
             currentUrl,
           );
-          return await FALLBACKIMAGES[type]();
+          return await fallback();
         }
         // resolve relative redirects against current URL
         try {
           currentUrl = new URL(location, currentUrl).toString();
         } catch (err) {
           safeOnError(onError, err, "fetch", location);
-          return await FALLBACKIMAGES[type]();
+          return await fallback();
         }
         continue;
       }
@@ -458,7 +626,7 @@ const fetchFromNetwork = async (
           "fetch",
           currentUrl,
         );
-        return await FALLBACKIMAGES[type]();
+        return await fallback();
       }
 
       const contentType = (
@@ -480,7 +648,7 @@ const fetchFromNetwork = async (
         "fetch",
         currentUrl,
       );
-      return await FALLBACKIMAGES[type]();
+      return await fallback();
     }
     // exhausted redirect budget
     safeOnError(
@@ -489,10 +657,10 @@ const fetchFromNetwork = async (
       "fetch",
       src,
     );
-    return await FALLBACKIMAGES[type]();
+    return await fallback();
   } catch (err) {
     safeOnError(onError, err, "fetch", src);
-    return await FALLBACKIMAGES[type]();
+    return await fallback();
   }
 };
 
@@ -502,6 +670,14 @@ const fetchFromNetwork = async (
  * @param {string} filePath - Path to the image file.
  * @param {string} baseDir - Base directory to resolve paths.
  * @param {ImageType} [type="normal"] - Type of fallback image if the path is invalid.
+ * @param {number} [maxBytes] - Optional max file size; larger files fall back.
+ * @param {PixelServeOnError} [onError] - Optional error observability hook.
+ * @param {() => void} [onFallback] - Optional callback fired whenever this
+ *   call resolves to the bundled `FALLBACKIMAGES[type]()` placeholder rather
+ *   than the requested file's real bytes. Lets callers (namely `serveImage`)
+ *   distinguish a genuinely-served image from a placeholder without
+ *   re-deriving the same validity/size checks. Trailing and optional so the
+ *   exported signature stays backward-compatible.
  * @returns {Promise<Buffer>} A buffer containing the image data.
  */
 export const readLocalImage = async (
@@ -510,7 +686,12 @@ export const readLocalImage = async (
   type: ImageType = "normal",
   maxBytes?: number,
   onError?: PixelServeOnError,
+  onFallback?: () => void,
 ): Promise<Buffer> => {
+  const fallback = async (): Promise<Buffer> => {
+    onFallback?.();
+    return FALLBACKIMAGES[type]();
+  };
   const isValid = await isValidPath(baseDir, filePath);
   if (!isValid) {
     safeOnError(
@@ -519,7 +700,7 @@ export const readLocalImage = async (
       "fs",
       filePath,
     );
-    return await FALLBACKIMAGES[type]();
+    return await fallback();
   }
   try {
     const resolvedFile = path.resolve(baseDir, filePath);
@@ -534,13 +715,13 @@ export const readLocalImage = async (
           "fs",
           filePath,
         );
-        return await FALLBACKIMAGES[type]();
+        return await fallback();
       }
     }
     return await fs.readFile(resolvedFile);
   } catch (err) {
     safeOnError(onError, err, "fs", filePath);
-    return await FALLBACKIMAGES[type]();
+    return await fallback();
   }
 };
 
@@ -566,13 +747,97 @@ export const stripApiPrefix = (
 };
 
 /**
+ * Normalizes a configured `websiteURL` (bare hostname, `host:port`, or a
+ * full URL, all three accepted by `optionsSchema`) into the `{ hostname,
+ * host }` pair `fetchImage` compares against `url.hostname`/`url.host`.
+ *
+ * `websiteURL` is parsed as a URL by prepending a placeholder `http://`
+ * scheme whenever the configured value has no `://` of its own — otherwise
+ * a bare `host:port` value like `"localhost:3001"` parses as the opaque-path
+ * URL `{ protocol: "localhost:", pathname: "3001" }` instead of an authority
+ * with a host (verified against `new URL()`'s WHATWG behavior), which is not
+ * what an operator configuring `websiteURL: "localhost:3001"` means. The
+ * scheme itself is discarded — only `hostname`/`host` are read.
+ *
+ * On parse failure (defensively — `optionsSchema` already restricts
+ * `websiteURL` to values that parse cleanly this way), falls back to
+ * comparing the raw configured string directly, matching this function's
+ * pre-normalization behavior so a parse failure never makes a
+ * previously-working exact-string config silently stop matching.
+ *
+ * Returns `null` when `websiteURL` is `undefined` (internal-host detection
+ * disabled entirely, matching prior behavior).
+ */
+const normalizeWebsiteHost = (
+  websiteURL: string | undefined,
+): { hostname: string; host: string } | null => {
+  if (websiteURL === undefined) return null;
+  try {
+    const parsed = new URL(
+      websiteURL.includes("://") ? websiteURL : `http://${websiteURL}`,
+    );
+    return { hostname: parsed.hostname, host: parsed.host };
+  } catch {
+    return { hostname: websiteURL, host: websiteURL };
+  }
+};
+
+/**
+ * Resolves an `http(s)` URL `src` to an API-prefix-stripped local pathname
+ * when its host matches the configured `websiteURL` (the "internal host"
+ * case — the app's own image endpoint referencing itself by absolute URL).
+ * Returns `null` when `src` does not parse as a URL, `websiteURL` is not
+ * configured (`normalizeWebsiteHost` returns `null`), or the URL's host
+ * matches neither the bare nor `www.`-prefixed configured hostname/host.
+ *
+ * Single source of truth for "is this src actually a local file reachable
+ * through our own internal host" — shared by `fetchImage` (decides whether
+ * to read locally or fetch over the network) and `buildSourceIdentifier`
+ * (`pixel.ts`; keys the deterministic ETag on the underlying file's
+ * `mtime:size` rather than the immutable URL string) so the two internal-
+ * host detection rules cannot drift apart.
+ */
+export const resolveInternalLocalPath = (
+  src: string,
+  websiteURL: string | undefined,
+  apiRegex: RegExp,
+  apiPrefix: string | undefined,
+): string | null => {
+  let url: URL;
+  try {
+    url = new URL(src);
+  } catch {
+    return null;
+  }
+  const configuredHost = normalizeWebsiteHost(websiteURL);
+  const isInternal =
+    configuredHost !== null &&
+    ([configuredHost.hostname, `www.${configuredHost.hostname}`].includes(
+      url.hostname,
+    ) ||
+      [configuredHost.host, `www.${configuredHost.host}`].includes(url.host));
+  if (!isInternal) return null;
+  return stripApiPrefix(url.pathname, apiRegex, apiPrefix);
+};
+
+/**
  * Fetches an image from either a local file or a network source.
  *
  * @param {string} src - The URL or local path of the image.
  * @param {string} baseDir - Base directory to resolve local paths.
- * @param {string} websiteURL - The URL of the website.
+ * @param {string} websiteURL - The website's configured internal host —
+ *   accepts a bare hostname (`"example.com"`), a `host:port` pair
+ *   (`"example.com:8080"`), or a full URL (`"https://example.com:8080"`);
+ *   all three are normalized to a hostname/host pair via
+ *   `normalizeWebsiteHost` before comparison.
  * @param {ImageType} [type="normal"] - Type of fallback image if the path is invalid.
  * @param {string[]} [allowedNetworkList=[]] - List of allowed network hosts.
+ *
+ * The trailing options object also accepts an optional `onFallback: () =>
+ * void` field, fired whenever this call resolves to the bundled
+ * `FALLBACKIMAGES[type]()` placeholder rather than genuinely-resolved bytes —
+ * whether from the internal-local, network, or exception-recovery branch.
+ * Optional and additive, so the exported signature stays backward-compatible.
  * @returns {Promise<Buffer>} A buffer containing the image data or a fallback image.
  */
 export const fetchImage = (
@@ -588,25 +853,35 @@ export const fetchImage = (
     maxRedirects = 3,
     onError,
     apiPrefix,
+    onFallback,
   }: {
     timeoutMs: number;
     maxBytes: number;
     maxRedirects?: number;
     onError?: PixelServeOnError;
     apiPrefix?: string;
+    onFallback?: () => void;
   },
 ): Promise<Buffer> => {
   try {
-    const url = new URL(src);
-    const isInternal =
-      websiteURL !== undefined &&
-      [websiteURL, `www.${websiteURL}`].includes(url.hostname);
-
-    if (isInternal) {
-      const localPath = stripApiPrefix(url.pathname, apiRegex, apiPrefix);
-      return readLocalImage(localPath, baseDir, type, maxBytes, onError);
+    const internalLocalPath = resolveInternalLocalPath(
+      src,
+      websiteURL,
+      apiRegex,
+      apiPrefix,
+    );
+    if (internalLocalPath !== null) {
+      return readLocalImage(
+        internalLocalPath,
+        baseDir,
+        type,
+        maxBytes,
+        onError,
+        onFallback,
+      );
     }
 
+    const url = new URL(src);
     const allowedCondition = isHostAllowed(
       url.hostname,
       url.host,
@@ -619,6 +894,7 @@ export const fetchImage = (
         "fetch",
         src,
       );
+      onFallback?.();
       return FALLBACKIMAGES[type]();
     }
     if (!["http:", "https:"].includes(url.protocol)) {
@@ -628,6 +904,7 @@ export const fetchImage = (
         "fetch",
         src,
       );
+      onFallback?.();
       return FALLBACKIMAGES[type]();
     }
     return fetchFromNetwork(src, type, {
@@ -636,9 +913,10 @@ export const fetchImage = (
       allowedNetworkList,
       maxRedirects,
       onError,
+      onFallback,
     });
   } catch (err) {
     safeOnError(onError, err, "fetch", src);
-    return readLocalImage(src, baseDir, type, maxBytes, onError);
+    return readLocalImage(src, baseDir, type, maxBytes, onError, onFallback);
   }
 };

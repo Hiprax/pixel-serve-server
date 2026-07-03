@@ -276,10 +276,13 @@ the package root.
   in the pipeline. The pipeline always continues to serve a fallback
   image; the hook is purely for logs / metrics. Best-effort: throws are
   swallowed.
-- `onComplete({ src?, userId?, format, outputBytes, cached, durationMs })` —
-  fired after a successful 200 response or a 304 cached short-circuit.
-  Use this to derive per-request latency, cache-hit ratios, and bytes-out
-  without scraping HTTP access logs.
+- `onComplete({ src?, userId?, format, outputBytes, cached, durationMs, fallback })` —
+  fired after every response that resolves to a 200 (a genuinely resolved
+  image OR a bundled-placeholder fallback) or a 304 cached short-circuit,
+  exactly once per response. `fallback: true` marks a bundled placeholder
+  rather than a real image (always `false` on a 304). Use this to derive
+  per-request latency, cache-hit ratios, and bytes-out without scraping
+  HTTP access logs.
 
 Both are optional and have no effect when not configured.
 

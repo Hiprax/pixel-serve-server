@@ -13,6 +13,7 @@ export {
   resolvePinnedAddress,
   buildPinnedAgents,
   stripApiPrefix,
+  resolveInternalLocalPath,
 } from "./functions";
 export {
   buildFilename,

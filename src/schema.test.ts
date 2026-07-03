@@ -9,7 +9,11 @@ describe("userDataSchema", () => {
     expect(result.src).toBeUndefined();
     expect(result.folder).toBe("public");
     expect(result.type).toBe("normal");
-    expect(result.quality).toBe(80);
+    // Phase 5: quality is no longer defaulted at the schema layer — the raw
+    // schema now yields `undefined`, and `renderUserData`'s
+    // `parsed.quality ?? bounds.defaultQuality` is the sole place a default
+    // (80 by default) is applied. See renders.test.ts for that contract.
+    expect(result.quality).toBeUndefined();
   });
 
   it("validates complete input", () => {
@@ -121,7 +125,10 @@ describe("userDataSchema", () => {
 
     expect(result.width).toBeUndefined();
     expect(result.height).toBeUndefined();
-    expect(result.quality).toBe(80);
+    // Phase 5: an explicit `undefined` quality is no longer coerced to 80 at
+    // the schema layer (see the "validates minimal input with defaults" case
+    // above for the same contract on a totally-omitted key).
+    expect(result.quality).toBeUndefined();
     expect(result.userId).toBeUndefined();
   });
 
@@ -300,6 +307,52 @@ describe("optionsSchema", () => {
     });
     expect(result.minWidth).toBe(500);
     expect(result.maxWidth).toBe(500);
+  });
+
+  it("rejects maxWidth above the framework's 4000 ceiling", () => {
+    expect(() =>
+      optionsSchema.parse({ baseDir: "/images", maxWidth: 6000 }),
+    ).toThrow(
+      /minWidth and maxWidth must lie within the framework's hard \[50, 4000\] dimension window/,
+    );
+  });
+
+  it("rejects minWidth below the framework's 50 floor", () => {
+    expect(() =>
+      optionsSchema.parse({ baseDir: "/images", minWidth: 10 }),
+    ).toThrow(
+      /minWidth and maxWidth must lie within the framework's hard \[50, 4000\] dimension window/,
+    );
+  });
+
+  it("rejects maxHeight above the framework's 4000 ceiling", () => {
+    expect(() =>
+      optionsSchema.parse({ baseDir: "/images", maxHeight: 5000 }),
+    ).toThrow(
+      /minHeight and maxHeight must lie within the framework's hard \[50, 4000\] dimension window/,
+    );
+  });
+
+  it("rejects minHeight below the framework's 50 floor", () => {
+    expect(() =>
+      optionsSchema.parse({ baseDir: "/images", minHeight: 10 }),
+    ).toThrow(
+      /minHeight and maxHeight must lie within the framework's hard \[50, 4000\] dimension window/,
+    );
+  });
+
+  it("accepts operator bounds at the exact [50, 4000] window edges", () => {
+    const result = optionsSchema.parse({
+      baseDir: "/images",
+      minWidth: 50,
+      maxWidth: 4000,
+      minHeight: 50,
+      maxHeight: 4000,
+    });
+    expect(result.minWidth).toBe(50);
+    expect(result.maxWidth).toBe(4000);
+    expect(result.minHeight).toBe(50);
+    expect(result.maxHeight).toBe(4000);
   });
 
   it("provides defaults for SSRF/decompression-bomb options", () => {

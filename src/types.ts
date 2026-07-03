@@ -62,9 +62,12 @@ export type PixelServeOnError = (
 
 /**
  * Context passed to the `onComplete` observability hook on the happy path
- * (200 response after a successful Sharp pipeline) and on the 304 short-
- * circuit (when `If-None-Match` matched a deterministic ETag and Sharp was
- * skipped entirely).
+ * (200 response after a successful Sharp pipeline), on either 304 short-
+ * circuit (an `If-None-Match` match against the pre-Sharp deterministic
+ * ETag, skipping Sharp entirely, OR against the post-Sharp buffer-hash
+ * ETag used when no deterministic source identifier is available), and on
+ * the hard-fallback path (a 200 response serving the bundled placeholder
+ * verbatim after the outer pipeline catch).
  *
  * - `src` / `userId` carry the validated request inputs.
  * - `format` is the output format actually used by the response.
@@ -73,6 +76,14 @@ export type PixelServeOnError = (
  * - `durationMs` measures end-to-end pipeline latency from the start of
  *   `serveImage` to the moment `res.send` (or `res.end`) was invoked,
  *   captured via `process.hrtime.bigint()` for monotonic precision.
+ * - `fallback` is `true` when the served bytes are a bundled placeholder
+ *   image rather than a genuinely resolved-and-encoded source — this
+ *   covers both a "soft" fallback (e.g. a missing file or blocked host,
+ *   still re-encoded through Sharp on a 200) and a "hard" fallback (the
+ *   outer pipeline catch serving the bundled asset verbatim on a 200).
+ *   `false` for a genuinely resolved-and-encoded image. 304 short-circuits
+ *   always report `false` — no bytes are sent, so there is nothing to
+ *   characterize as fallback-or-not for that response.
  *
  * Additional fields may be appended in the future; consumers should treat
  * the shape as open.
@@ -84,15 +95,20 @@ export type PixelServeCompletionContext = {
   outputBytes: number;
   cached: boolean;
   durationMs: number;
+  fallback: boolean;
 };
 
 /**
  * Observability hook fired after the response has been flushed on the
- * happy path (200 + image bytes) and on the 304 cached short-circuit. The
- * callback runs synchronously (any returned promise is ignored) and must
- * not throw — throws are swallowed so a buggy logger cannot crash a request.
- * Use this hook to emit structured logs, ship per-request latency metrics
- * to your APM, or count cache-hit ratios.
+ * happy path (200 + image bytes), on the 304 cached short-circuit, and on
+ * the hard-fallback path (a 200 serving the bundled placeholder verbatim
+ * after the outer pipeline catch) — every response that resolves to a 200
+ * or a 304 fires this hook exactly once. The callback runs synchronously
+ * (any returned promise is ignored) and must not throw — throws are
+ * swallowed so a buggy logger cannot crash a request. Use this hook to
+ * emit structured logs, ship per-request latency metrics to your APM, or
+ * count cache-hit ratios; use the `fallback` field on its context to
+ * distinguish a genuinely-served image from a bundled placeholder.
  */
 export type PixelServeOnComplete = (
   context: PixelServeCompletionContext,
@@ -205,9 +221,12 @@ export type PixelServeOptions = {
   onError?: PixelServeOnError;
   /**
    * Optional observability hook invoked after the response has been flushed
-   * on the happy path (200 response with image bytes) and after the 304
-   * cached short-circuit. Use this hook to ship per-request latency metrics,
-   * count cache-hit ratios, or feed structured logs into your APM.
+   * on the happy path (200 response with image bytes), after the 304 cached
+   * short-circuit, and after the hard-fallback path (a 200 serving the
+   * bundled placeholder verbatim following the outer pipeline catch). Use
+   * this hook to ship per-request latency metrics, count cache-hit ratios,
+   * or feed structured logs into your APM; the context's `fallback` field
+   * distinguishes a genuinely-served image from a bundled placeholder.
    *
    * The hook is best-effort: throws from the hook are suppressed and never
    * escape the middleware. The hook runs synchronously; any returned promise

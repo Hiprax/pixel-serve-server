@@ -2,6 +2,7 @@ import axios from "axios";
 import express from "express";
 import sharp from "sharp";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import type { LookupAddress } from "node:dns";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
@@ -112,8 +113,18 @@ describe("registerServe middleware", () => {
     expect(response.body.length > 0).toBe(true);
   });
 
-  it("returns 304 when ETag matches", async () => {
-    const app = createApp();
+  it("returns 304 when ETag matches, echoing ETag/Cache-Control/Vary per RFC 9110 §15.4.5", async () => {
+    // Deliberately NOT createApp(): its configured cacheControl
+    // ("public, max-age=60") is byte-identical to FALLBACK_CACHE_CONTROL, so
+    // asserting Cache-Control against that value here would pass whether the
+    // 304 echoes the operator's genuine config or the fallback constant by
+    // mistake. An explicit, distinct custom value proves the 304 echoes the
+    // OPERATOR'S CONFIGURED Cache-Control, not a coincidental match.
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({ baseDir: assetDir, cacheControl: "private, no-cache" }),
+    );
     const first = await request(app)
       .get("/api/v1/pixel/serve")
       .query({ src: "noimage.jpg", format: "jpeg" })
@@ -128,6 +139,9 @@ describe("registerServe middleware", () => {
       .query({ src: "noimage.jpg", format: "jpeg" });
 
     expect(second.status).toBe(304);
+    expect(second.headers.etag).toBe(etag);
+    expect(second.headers["cache-control"]).toBe("private, no-cache");
+    expect(second.headers["vary"]).toBe("Accept-Encoding");
   });
 
   it("uses custom private folder resolver", async () => {
@@ -332,12 +346,30 @@ describe("registerServe middleware", () => {
   });
 
   it("serves default fallback when src missing", async () => {
-    const app = createApp();
+    const onComplete = vi.fn();
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        cacheControl: "public, max-age=60",
+        allowedNetworkList: ["allowed.test"],
+        websiteURL: "localhost",
+        onComplete,
+      }),
+    );
     const response = await request(app).get("/api/v1/pixel/serve").query({});
 
     expect(response.status).toBe(200);
     expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
     expect(response.body.length).toBeGreaterThan(0);
+    // Distinct soft-fallback trigger from the missing-local-file case covered
+    // elsewhere: resolveBuffer's very first branch (no src at all) marks the
+    // fallback directly, before ever calling readLocalImage/fetchImage.
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(
+      (onComplete.mock.calls[0]![0] as { fallback: boolean }).fallback,
+    ).toBe(true);
   });
 
   it("serves image without resize when dimensions not specified", async () => {
@@ -502,7 +534,7 @@ describe("registerServe middleware", () => {
     expect(response.status).toBe(200);
   });
 
-  it("clamps dimensions to min/max bounds", async () => {
+  it("clamps dimensions to the operator min/max bounds", async () => {
     const app = express();
     app.get(
       "/api/v1/pixel/serve",
@@ -515,17 +547,28 @@ describe("registerServe middleware", () => {
       }),
     );
 
+    // Both requested dimensions lie INSIDE the framework's hard [50, 4000]
+    // window — so `userDataSchema` accepts them and the request actually
+    // reaches `renderUserData`'s clamp() step — but OUTSIDE the operator
+    // bounds above: width 60 is below minWidth 100 → clamped UP to 100;
+    // height 2000 is above maxHeight 500 → clamped DOWN to 500. (A width of
+    // 10, as this test previously used, would instead be rejected by
+    // `userDataSchema`'s absolute 50-px floor BEFORE clamp() ever runs, so
+    // the request would serve the unresized 500×500 fallback image — which
+    // vacuously satisfies a loose `<= 500` assertion without ever exercising
+    // clamping.) The source asset `noimage.jpg` is 500×500, so the cover-fit
+    // resize genuinely produces EXACTLY 100×500 with no enlargement.
     const response = await request(app)
       .get("/api/v1/pixel/serve")
-      .query({ src: "noimage.jpg", width: 10, height: 1000, format: "jpeg" })
+      .query({ src: "noimage.jpg", width: 60, height: 2000, format: "jpeg" })
       .parse(bufferParser);
 
     expect(response.status).toBe(200);
     const metadata = await sharp(response.body).metadata();
-    // Width was 10 (below min 100), clamped to 100; height was 1000 (above max 500), clamped to 500
-    // withoutEnlargement may prevent actual upscale, but dimensions should not exceed max
-    if (metadata.width) expect(metadata.width).toBeLessThanOrEqual(500);
-    if (metadata.height) expect(metadata.height).toBeLessThanOrEqual(500);
+    // Assert the EXACT clamped output dimensions (not a loose bound): 60 was
+    // clamped up to minWidth 100, 2000 was clamped down to maxHeight 500.
+    expect(metadata.width).toBe(100);
+    expect(metadata.height).toBe(500);
   });
 
   it("serves avatar fallback when src is empty and type is avatar", async () => {
@@ -707,9 +750,20 @@ describe("registerServe middleware", () => {
       .query({ src: "noimage.jpg", type: "avatar", format: "jpeg" })
       .parse(bufferParser);
 
-    // Should still return 200 with the avatar fallback
+    // The outer catch serves the pre-encoded AVATAR fallback asset
+    // (`noavatar.png`) VERBATIM — no Sharp re-encode — so BOTH the served
+    // body and the Content-Type must reflect that PNG asset, not the normal
+    // JPEG fallback. Asserting the actual response BYTES (not just the
+    // header) is what lets this test catch a regression in the
+    // avatar-vs-normal fallback selection: the previous header-only assertion
+    // passed identically whether or not that selection worked, because the
+    // header was hardcoded.
     expect(response.status).toBe(200);
-    expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+    expect(response.headers["content-type"]).toBe(mimeTypes.png);
+    const avatarFallback = await FALLBACKIMAGES.avatar();
+    const normalFallback = await FALLBACKIMAGES.normal();
+    expect(avatarFallback.equals(response.body)).toBe(true);
+    expect(normalFallback.equals(response.body)).toBe(false);
   });
 
   it("handles custom cacheControl value in response", async () => {
@@ -1037,6 +1091,46 @@ describe("registerServe middleware", () => {
   });
 });
 
+describe("defaultQuality actually governs (Phase 5)", () => {
+  it("encodes at the configured defaultQuality when the request omits quality", async () => {
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({ baseDir: assetDir, defaultQuality: 60 }),
+    );
+    const toFormatSpy = vi.spyOn(sharp.prototype, "toFormat");
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(toFormatSpy).toHaveBeenCalledWith(
+      "jpeg",
+      expect.objectContaining({ quality: 60 }),
+    );
+    toFormatSpy.mockRestore();
+  });
+
+  it("still encodes at 80 when defaultQuality is left at its own default", async () => {
+    const app = createApp();
+    const toFormatSpy = vi.spyOn(sharp.prototype, "toFormat");
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(toFormatSpy).toHaveBeenCalledWith(
+      "jpeg",
+      expect.objectContaining({ quality: 80 }),
+    );
+    toFormatSpy.mockRestore();
+  });
+});
+
 describe("idHandler safety", () => {
   it("falls back to raw userId when idHandler throws synchronously", async () => {
     const getUserFolder = vi.fn(async (_req: unknown, id?: string) => {
@@ -1228,8 +1322,7 @@ describe("EXIF auto-orient applied before resize", () => {
   it("produces correct output dimensions for an EXIF orientation=6 portrait JPEG", async () => {
     // Build a tagged source: 200x400 image authored upright, then encoded
     // with EXIF orientation=6 ("rotate 90 CW"). Visually this is a 400x200
-    // image; resizing to a square 100x100 must operate on the post-rotated
-    // 400x200 raster, not the raw 200x400 one.
+    // image.
     const baseBuffer = await sharp({
       create: {
         width: 200,
@@ -1252,24 +1345,36 @@ describe("EXIF auto-orient applied before resize", () => {
     expect(meta.width).toBe(200);
     expect(meta.height).toBe(400);
 
-    // Sanity: rotation followed by resize should yield 100x100 cover crop.
+    // Request a SINGLE dimension (width only, no height) rather than a
+    // square target. A square width+height request is vacuous here:
+    // `fit: cover` crops to fill the exact box regardless of source
+    // orientation, so both the raw 200x400 raster and the rotated 400x200
+    // one land on the same output size whether or not `.rotate()` actually
+    // ran -- the old assertion passed even with rotation silently dropped.
+    // With only `width` supplied, Sharp instead scales proportionally to
+    // the source aspect ratio, so the two orderings diverge and become
+    // observable: rotate-before-resize operates on the post-rotation
+    // 400x200 raster (height = 100 * 200/400 = 50), while a regression that
+    // drops `.rotate()` would resize the raw 200x400 raster instead
+    // (height = 100 * 400/200 = 200).
     const expected = await sharp(tagged)
       .rotate()
       .resize({
         width: 100,
-        height: 100,
         fit: sharp.fit.cover,
         withoutEnlargement: true,
       })
       .jpeg()
       .toBuffer();
     const expectedMeta = await sharp(expected).metadata();
+    // Empirically confirmed against this fixture: correct (rotate-before-
+    // resize) output is 100x50.
     expect(expectedMeta.width).toBe(100);
-    expect(expectedMeta.height).toBe(100);
+    expect(expectedMeta.height).toBe(50);
 
     // Now run the buffer through the middleware end-to-end and confirm the
-    // visible output also reads as 100x100, proving rotate() ran before
-    // resize() in the pipeline.
+    // visible output also reads as 100x50, proving rotate() ran before
+    // resize() in the pipeline (a dropped `.rotate()` would yield 100x200).
     const tmpDir = path.join(assetDir, "..", "tmp-exif");
     const fsmod = await import("node:fs/promises");
     await fsmod.mkdir(tmpDir, { recursive: true });
@@ -1285,7 +1390,6 @@ describe("EXIF auto-orient applied before resize", () => {
         .query({
           src: "portrait-orient6.jpg",
           width: 100,
-          height: 100,
           format: "jpeg",
         })
         .parse(bufferParser);
@@ -1294,7 +1398,7 @@ describe("EXIF auto-orient applied before resize", () => {
       const outMeta = await sharp(response.body).metadata();
       expect(outMeta.format).toBe("jpeg");
       expect(outMeta.width).toBe(100);
-      expect(outMeta.height).toBe(100);
+      expect(outMeta.height).toBe(50);
       // Sharp's rotate() always strips EXIF orientation; the output should
       // carry the default orientation (undefined or 1).
       expect(
@@ -1798,6 +1902,218 @@ describe("deterministic ETag (Task 6)", () => {
       .get("/api/v1/pixel/serve")
       .set("If-None-Match", response.headers.etag as string)
       .query({ src: "missing-file.jpg", format: "jpeg" });
+    expect(repeat.status).toBe(304);
+  });
+
+  it("post-Sharp 304 on a recurring soft fallback (missing local file) echoes the fallback Cache-Control, not the operator's configured value", async () => {
+    // Deliberately NOT createApp(): its configured cacheControl
+    // ("public, max-age=60") is byte-identical to FALLBACK_CACHE_CONTROL, so
+    // asserting the 304's Cache-Control against that value would pass
+    // whether or not the post-Sharp 304 site actually reads
+    // `servedSoftFallback` — it would look identical to simply echoing the
+    // operator's config unconditionally. An explicit, distinct custom value
+    // proves the fallback policy wins over the operator's own setting.
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({ baseDir: assetDir, cacheControl: "private, no-cache" }),
+    );
+    const first = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "missing-file.jpg", format: "jpeg" })
+      .parse(bufferParser);
+    expect(first.status).toBe(200);
+    expect(first.headers["cache-control"]).toBe("public, max-age=60");
+    const etag = first.headers.etag as string;
+    expect(etag).toBeDefined();
+
+    // Same request again, presenting the buffer-hash ETag captured above —
+    // this is the post-Sharp 304 short-circuit (no deterministic source
+    // identifier exists for a missing file), and the file is STILL missing,
+    // so this is still a soft fallback.
+    const second = await request(app)
+      .get("/api/v1/pixel/serve")
+      .set("If-None-Match", etag)
+      .query({ src: "missing-file.jpg", format: "jpeg" });
+    expect(second.status).toBe(304);
+    expect(second.headers.etag).toBe(etag);
+    expect(second.headers["cache-control"]).toBe("public, max-age=60");
+    expect(second.headers["vary"]).toBe("Accept-Encoding");
+  });
+
+  it("buildSourceIdentifier returns null for a traversal src referencing an existing out-of-tree file (Task 4 containment gate)", async () => {
+    // "../pixel.ts" resolves outside assetDir to this package's own real
+    // source file, which exists on disk. Before the isValidPath gate, the
+    // local-file branch would fs.stat this out-of-tree file directly and
+    // return a deterministic `file:<mtimeMs>:<size>` identifier — an ETag
+    // oracle for a file having nothing to do with the request. isValidPath
+    // now rejects the traversal before fs.stat ever runs, so the identifier
+    // degrades to null.
+    const result = await buildSourceIdentifier("../pixel.ts", assetDir);
+    expect(result).toBeNull();
+  });
+
+  it("a traversal src produces a response ETag equal to the buffer-hash of the SERVED bytes, not a file:-derived identifier (Task 4)", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "../pixel.ts", format: "jpeg" })
+      .parse(bufferParser);
+    expect(response.status).toBe(200);
+    const etag = response.headers.etag as string;
+    expect(etag).toBeDefined();
+    // readLocalImage independently rejects the same traversal via its own
+    // isValidPath check and serves FALLBACKIMAGES.normal(), reprocessed by
+    // Sharp per the request. The ETag must be the sha256 buffer-hash of
+    // exactly those served bytes, proving the deterministic file:-identifier
+    // short-circuit never fired for this request (it would otherwise encode
+    // pixel.ts's own mtime/size instead).
+    const expectedBufferHashEtag = `"${createHash("sha256")
+      .update(response.body as Buffer)
+      .digest("hex")}"`;
+    expect(etag).toBe(expectedBufferHashEtag);
+
+    // A second request with If-None-Match set to that ETag must 304,
+    // confirming the buffer-hash ETag is stable/reproducible and not an
+    // artifact of the first request only.
+    const repeat = await request(app)
+      .get("/api/v1/pixel/serve")
+      .set("If-None-Match", etag)
+      .query({ src: "../pixel.ts", format: "jpeg" });
+    expect(repeat.status).toBe(304);
+  });
+
+  it("keys the source identifier for an internal-host URL src on the underlying file, matching the direct-local-path identifier (Phase 3)", async () => {
+    // `buildSourceIdentifier` must resolve an internal-host URL (one whose
+    // host matches the configured websiteURL) to the SAME file:mtimeMs:size
+    // identifier as requesting the underlying local path directly — proving
+    // the ETag is keyed on the on-disk file, not the immutable URL string.
+    const directSid = await buildSourceIdentifier("noimage.jpg", assetDir, {
+      websiteURL: "localhost",
+    });
+    const internalSid = await buildSourceIdentifier(
+      "http://localhost/api/v1/noimage.jpg",
+      assetDir,
+      { websiteURL: "localhost" },
+    );
+    expect(directSid).not.toBeNull();
+    expect(directSid).toMatch(/^file:\d+(?:\.\d+)?:\d+$/);
+    expect(internalSid).toBe(directSid);
+  });
+
+  it("invalidates the response ETag for an internal-host URL src when the underlying file changes (Phase 3)", async () => {
+    // Mirrors "invalidates the deterministic ETag when the underlying file
+    // changes" above, but the request src is an internal-host URL
+    // (`http://localhost/api/v1/<asset>`) rather than a direct local path.
+    // Use a tmp file so we can rewrite it to change mtimeMs/size.
+    const fsmod = await import("node:fs/promises");
+    const tmpDir = path.join(assetDir, "..", "tmp-etag-internal");
+    await fsmod.mkdir(tmpDir, { recursive: true });
+    const tmpName = "shifty-internal.png";
+    const tmpFile = path.join(tmpDir, tmpName);
+    const v1 = await sharp({
+      create: {
+        width: 80,
+        height: 80,
+        channels: 3,
+        background: { r: 0, g: 0, b: 255 },
+      },
+    })
+      .png()
+      .toBuffer();
+    await fsmod.writeFile(tmpFile, v1);
+
+    try {
+      const app = express();
+      app.get(
+        "/api/v1/pixel/serve",
+        registerServe({ baseDir: tmpDir, websiteURL: "localhost" }),
+      );
+      const internalSrc = `http://localhost/api/v1/${tmpName}`;
+
+      const first = await request(app)
+        .get("/api/v1/pixel/serve")
+        .query({ src: internalSrc, format: "png" })
+        .parse(bufferParser);
+      expect(first.status).toBe(200);
+      // Confirms the request was served from local disk (internal-host
+      // branch), not the network branch.
+      expect(axios.get).not.toHaveBeenCalled();
+      const initialEtag = first.headers.etag as string;
+      expect(initialEtag).toBeDefined();
+
+      // Rewrite with different content -> mtime/size change.
+      await new Promise((r) => setTimeout(r, 20));
+      const v2 = await sharp({
+        create: {
+          width: 80,
+          height: 80,
+          channels: 3,
+          background: { r: 0, g: 255, b: 0 },
+        },
+      })
+        .png()
+        .toBuffer();
+      await fsmod.writeFile(tmpFile, v2);
+
+      const second = await request(app)
+        .get("/api/v1/pixel/serve")
+        .query({ src: internalSrc, format: "png" })
+        .parse(bufferParser);
+      const newEtag = second.headers.etag as string;
+      expect(newEtag).toBeDefined();
+      expect(newEtag).not.toBe(initialEtag);
+
+      // The stale (pre-change) ETag must no longer satisfy If-None-Match —
+      // under the old url:-keyed identifier this would incorrectly 304
+      // forever, since the URL string itself never changes.
+      const staleCheck = await request(app)
+        .get("/api/v1/pixel/serve")
+        .set("If-None-Match", initialEtag)
+        .query({ src: internalSrc, format: "png" });
+      expect(staleCheck.status).toBe(200);
+    } finally {
+      await fsmod.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null for a local file exceeding maxBytes; the live response ETag is a stable buffer-hash, not a file:-derived identifier (Phase 3)", async () => {
+    const fsmod = await import("node:fs/promises");
+    const stats = await fsmod.stat(path.join(assetDir, "noimage.jpg"));
+    const tinyMax = stats.size - 1;
+
+    // Direct proof: the oversized-file guard degrades buildSourceIdentifier
+    // to null, mirroring readLocalImage's own size guard (which serves the
+    // fallback buffer instead) so the two never decouple.
+    const sid = await buildSourceIdentifier("noimage.jpg", assetDir, {
+      maxBytes: tinyMax,
+    });
+    expect(sid).toBeNull();
+
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({ baseDir: assetDir, maxDownloadBytes: tinyMax }),
+    );
+    const first = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg" })
+      .parse(bufferParser);
+    expect(first.status).toBe(200);
+    const etag = first.headers.etag as string;
+    expect(etag).toBeDefined();
+    // With no deterministic identifier available, the pipeline must fall
+    // back to hashing the actually-served (fallback) bytes.
+    const expectedBufferHashEtag = `"${createHash("sha256")
+      .update(first.body as Buffer)
+      .digest("hex")}"`;
+    expect(etag).toBe(expectedBufferHashEtag);
+
+    // Stable / reproducible across a second identical request.
+    const repeat = await request(app)
+      .get("/api/v1/pixel/serve")
+      .set("If-None-Match", etag)
+      .query({ src: "noimage.jpg", format: "jpeg" });
     expect(repeat.status).toBe(304);
   });
 });
@@ -2374,6 +2690,212 @@ describe("looksLikeSvg hardening (Task 4)", () => {
   });
 });
 
+describe("looksLikeSvg BOM/whitespace/comment combinations (Phase 6 Task 6.1)", () => {
+  it("detects a UTF-8 BOM followed by whitespace followed by <svg> (whitespace AFTER the BOM)", () => {
+    // Distinct from the existing "whitespace before a UTF-8 BOM" case: here
+    // the BOM comes first and the tolerated whitespace sits between the BOM
+    // and the root element.
+    const buf = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from("   \t\n<svg></svg>"),
+    ]);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  it("detects a UTF-16 LE BOM-prefixed, comment-prefixed SVG (real-world input shape distinct from the existing XML-prolog case)", () => {
+    // Note: `<?xml` and `<!--` prefixes both funnel into the identical
+    // `/<svg[\s>]/.test(trimmed)` statement in looksLikeSvg's UTF-16 branch,
+    // so this does not add NEW branch coverage on top of the pre-existing
+    // XML-prolog UTF-16 case — it pins a genuinely different real-world
+    // input shape (a comment-only preamble, no XML declaration) that a
+    // future refactor separating the two prefixes could otherwise regress
+    // silently.
+    const text = "<!-- c --><svg></svg>";
+    const utf16 = Buffer.alloc(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+      utf16.writeUInt16LE(text.charCodeAt(i), i * 2);
+    }
+    const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), utf16]);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  it("allows a UTF-8 BOM followed by ordinary plain text (negative — no false positive from the BOM alone)", () => {
+    const buf = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from("just a regular caption, not markup at all"),
+    ]);
+    expect(looksLikeSvg(buf)).toBe(false);
+  });
+
+  it("does not over-block a UTF-16 BOM-prefixed plain-text buffer that merely contains the substring <svg> without a recognized prolog", () => {
+    // The UTF-16 branch must behave identically to the latin1/UTF-8 branch:
+    // its `<svg` window scan (and DOCTYPE-svg-root check) is gated on a
+    // recognized XML prolog (`<svg`/`<?xml`/`<!--`/`<!doctype`), NOT run
+    // unconditionally. Without that gate a UTF-16-encoded text/JSON/log file
+    // whose content happened to include the characters `<svg>` was wrongly
+    // classified as SVG (a false positive / over-block). The byte-identical
+    // content without a BOM (latin1 path) already returns false, so this
+    // pins the two branches to the same behavior.
+    const text = "caption for a diagram: see the <svg> tag reference below";
+    const utf16 = Buffer.alloc(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+      utf16.writeUInt16LE(text.charCodeAt(i), i * 2);
+    }
+    const utf16Bom = Buffer.concat([Buffer.from([0xff, 0xfe]), utf16]);
+    expect(looksLikeSvg(utf16Bom)).toBe(false);
+    // Symmetry check: the same text through the latin1/UTF-8 path (no BOM)
+    // is also not SVG — neither branch may blanket-scan for `<svg`.
+    expect(looksLikeSvg(Buffer.from(text))).toBe(false);
+  });
+});
+
+describe("metadata-based Sharp guards (Phase 6 Task 6.1)", () => {
+  it("rejects a buffer that evades the magic-byte sniffer but Sharp's own metadata still identifies it as SVG (defense in depth)", async () => {
+    // looksLikeSvg only inspects the first 4 KiB of the buffer. A real SVG
+    // document can pad its prolog (e.g. a huge comment) past that window so
+    // the app-level sniffer never sees the `<svg` tag. Verified empirically
+    // that Sharp/libvips' own loader dispatch is NOT bound by the same 4 KiB
+    // cap and still recognizes and parses such a buffer as format "svg" —
+    // the independent `meta.format === "svg"` guard inside the Sharp
+    // pipeline is what catches this case, proving the second layer of
+    // defense has real (not merely theoretical) value.
+    const filler = "<!--" + "x".repeat(5000) + "-->";
+    const svgText = `<?xml version="1.0" encoding="UTF-8"?>\n${filler}\n<svg xmlns="http://www.w3.org/2000/svg" width="50" height="50"><rect width="50" height="50"/></svg>`;
+    const svgBuffer = Buffer.from(svgText);
+    expect(svgBuffer.length).toBeGreaterThan(4096);
+    // Confirm the app-level sniffer genuinely misses this buffer — otherwise
+    // this test would be exercising the wrong guard entirely.
+    expect(looksLikeSvg(svgBuffer)).toBe(false);
+
+    const tmpDir = path.join(assetDir, "..", "tmp-svg-bypass");
+    const fsmod = await import("node:fs/promises");
+    await fsmod.mkdir(tmpDir, { recursive: true });
+    const tmpFile = path.join(tmpDir, "padded.svg");
+    await fsmod.writeFile(tmpFile, svgBuffer);
+
+    try {
+      const onError = vi.fn();
+      const app = express();
+      app.get(
+        "/api/v1/pixel/serve",
+        registerServe({ baseDir: tmpDir, onError }),
+      );
+      const response = await request(app)
+        .get("/api/v1/pixel/serve")
+        .query({ src: "padded.svg", format: "jpeg" })
+        .parse(bufferParser);
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+      const sharpErrors = onError.mock.calls.filter(
+        (c) => (c[1] as { phase: string }).phase === "sharp",
+      );
+      expect(sharpErrors.length).toBeGreaterThan(0);
+      expect(
+        sharpErrors.some((c) => (c[0] as Error).message.includes("svg")),
+      ).toBe(true);
+    } finally {
+      await fsmod.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects when Sharp's metadata peek reports a pixel count exceeding maxInputPixels (manual re-check)", async () => {
+    // Sharp's OWN `limitInputPixels` constructor option already throws
+    // directly inside `metadata()` for any real oversized image at the
+    // configured threshold (verified empirically across jpeg/png/webp/
+    // tiff/gif/avif/svg) — so the manual
+    // `meta.width * meta.height > maxInputPixels` re-check in pixel.ts can
+    // never fire via a real image at the SAME threshold; it is a
+    // defense-in-depth guard for a metadata() implementation that reports
+    // oversized dimensions without itself throwing (e.g. a future libvips
+    // change that defers enforcement to decode time). Pinned directly by
+    // mocking the metadata peek's return value, exactly as the existing
+    // Sharp-processing-error tests in this file already do for `toBuffer`.
+    const onError = vi.fn();
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({ baseDir: assetDir, onError }),
+    );
+
+    type SharpMetadataResult = Awaited<
+      ReturnType<typeof sharp.prototype.metadata>
+    >;
+    const metaSpy = vi
+      .spyOn(sharp.prototype, "metadata")
+      .mockResolvedValueOnce({
+        width: 99999,
+        height: 99999,
+        format: "jpeg",
+      } as unknown as SharpMetadataResult);
+
+    try {
+      const response = await request(app)
+        .get("/api/v1/pixel/serve")
+        .query({ src: "noimage.jpg", format: "jpeg" })
+        .parse(bufferParser);
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+      const sharpErrors = onError.mock.calls.filter(
+        (c) => (c[1] as { phase: string }).phase === "sharp",
+      );
+      expect(sharpErrors.length).toBeGreaterThan(0);
+      expect(
+        sharpErrors.some((c) =>
+          (c[0] as Error).message.includes("exceeds maxInputPixels"),
+        ),
+      ).toBe(true);
+    } finally {
+      metaSpy.mockRestore();
+    }
+  });
+
+  it("skips the pixel-count guard when metadata reports no width/height, and still serves a genuinely re-encoded image", async () => {
+    const app = express();
+    app.get("/api/v1/pixel/serve", registerServe({ baseDir: assetDir }));
+
+    type SharpMetadataResult = Awaited<
+      ReturnType<typeof sharp.prototype.metadata>
+    >;
+    const metaSpy = vi
+      .spyOn(sharp.prototype, "metadata")
+      .mockResolvedValueOnce({
+        width: undefined,
+        height: undefined,
+        format: "jpeg",
+      } as unknown as SharpMetadataResult);
+
+    try {
+      const response = await request(app)
+        .get("/api/v1/pixel/serve")
+        .query({ src: "noimage.jpg", format: "jpeg" })
+        .parse(bufferParser);
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+      // `noimage.jpg` is ALSO the "normal"-type fallback asset, so a
+      // 200/jpeg/non-empty response is satisfied identically whether the
+      // guard was correctly skipped (real pipeline success) OR whether it
+      // wrongly threw and the outer catch-all served the fallback instead —
+      // both paths process/serve that same file. The catch-all fallback
+      // path hardcodes `Content-Disposition: filename="fallback.jpeg"`
+      // (pixel.ts's outer catch), while the real pipeline derives the
+      // filename from `userData.src` via `buildFilename` — "noimage.jpeg".
+      // Asserting the LATTER is what actually distinguishes "guard skipped,
+      // pipeline ran to completion" from "guard broke and the response only
+      // LOOKS like success" (a regression this test would otherwise miss
+      // entirely, since both paths independently render as 200/jpeg/
+      // non-empty/valid-JPEG bytes).
+      expect(response.headers["content-disposition"]).toMatch(
+        /filename="noimage\.jpeg"/,
+      );
+      expect(response.body.length).toBeGreaterThan(0);
+      const metadata = await sharp(response.body as Buffer).metadata();
+      expect(metadata.format).toBe("jpeg");
+    } finally {
+      metaSpy.mockRestore();
+    }
+  });
+});
+
 describe("res.headersSent guard in outer catch (Task 5)", () => {
   it("calls next(error) when response was already flushed before the catch", async () => {
     // Plant a middleware that flips `res.headersSent` to true (via calling
@@ -2719,11 +3241,14 @@ describe("onComplete observability hook (Task 6)", () => {
       outputBytes: number;
       cached: boolean;
       durationMs: number;
+      fallback: boolean;
     };
     expect(ctx.src).toBe("noimage.jpg");
     expect(ctx.userId).toBeUndefined();
     expect(ctx.format).toBe("webp");
     expect(ctx.cached).toBe(false);
+    // A genuinely resolved-and-encoded image (not a bundled placeholder).
+    expect(ctx.fallback).toBe(false);
     // outputBytes should match the response body length exactly.
     expect(ctx.outputBytes).toBe(response.body.length);
     expect(ctx.outputBytes).toBeGreaterThan(0);
@@ -2767,11 +3292,79 @@ describe("onComplete observability hook (Task 6)", () => {
       outputBytes: number;
       format: string;
       durationMs: number;
+      fallback: boolean;
     };
     expect(ctx.cached).toBe(true);
     expect(ctx.outputBytes).toBe(0);
     expect(ctx.format).toBe("jpeg");
     expect(ctx.durationMs).toBeGreaterThanOrEqual(0);
+    // No bytes are sent on a 304 — fallback is always reported false.
+    expect(ctx.fallback).toBe(false);
+  });
+
+  it("fires with cached=true on the 304 short-circuit (buffer-hash ETag, no deterministic source identifier)", async () => {
+    // Distinct code path from the deterministic-ETag test above: when
+    // buildSourceIdentifier cannot derive a stable key (e.g. a missing
+    // local file, which still serves a valid fallback buffer), the ETag is
+    // instead computed AFTER Sharp processing by hashing the output buffer
+    // (pixel.ts's second `if (parsedOptions.etag && !etag)` branch). That
+    // 304 short-circuit and its onComplete dispatch are a physically
+    // different code location from the deterministic-ETag 304 above and
+    // must be pinned independently.
+    const onComplete = vi.fn();
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        onComplete,
+      }),
+    );
+
+    // "missing-file.jpg" does not exist -> buildSourceIdentifier returns
+    // null -> the pipeline falls back to the buffer-hash ETag. It also means
+    // resolveBuffer's readLocalImage call resolves to the bundled fallback
+    // (a "soft" fallback, still re-encoded through Sharp), so this doubles
+    // as the soft-fallback `fallback:true` coverage on a live 200 response.
+    const first = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "missing-file.jpg", format: "jpeg" })
+      .parse(bufferParser);
+    expect(first.status).toBe(200);
+    const etag = first.headers.etag as string;
+    expect(etag).toBeDefined();
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    const firstCtx = onComplete.mock.calls[0]![0] as {
+      cached: boolean;
+      fallback: boolean;
+    };
+    expect(firstCtx.cached).toBe(false);
+    expect(firstCtx.fallback).toBe(true);
+
+    onComplete.mockClear();
+
+    const second = await request(app)
+      .get("/api/v1/pixel/serve")
+      .set("If-None-Match", etag)
+      .query({ src: "missing-file.jpg", format: "jpeg" });
+    expect(second.status).toBe(304);
+
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    const ctx = onComplete.mock.calls[0]![0] as {
+      cached: boolean;
+      outputBytes: number;
+      format: string;
+      durationMs: number;
+      fallback: boolean;
+    };
+    expect(ctx.cached).toBe(true);
+    expect(ctx.outputBytes).toBe(0);
+    expect(ctx.format).toBe("jpeg");
+    expect(ctx.durationMs).toBeGreaterThanOrEqual(0);
+    // Still false on the 304 even though the underlying resource IS a
+    // fallback — no bytes are sent this round-trip, so there's nothing to
+    // characterize as fallback-or-not.
+    expect(ctx.fallback).toBe(false);
   });
 
   it("swallows throws from the onComplete hook so the response is unaffected", async () => {
@@ -2800,11 +3393,15 @@ describe("onComplete observability hook (Task 6)", () => {
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
 
-  it("does NOT fire on the outer fallback path (failure surface only goes through onError)", async () => {
-    // Confirms the success / cached hook is reserved for the happy path. A
-    // pipeline failure routes through the outer catch and serves the fallback
-    // via the catch branch — onComplete must remain silent so consumers can
-    // tell success from fallback without inspecting status codes.
+  it("fires with fallback:true on the outer hard-fallback path (Phase 8: previously silent)", async () => {
+    // A pipeline failure AFTER the source buffer is resolved (e.g. a Sharp
+    // encode failure) routes through the outer catch, which serves the
+    // bundled placeholder verbatim (skipping Sharp re-encoding entirely) —
+    // the "hard" fallback, distinct from the "soft" fallback the happy path
+    // can also report. Before Phase 8 this branch left onComplete silent;
+    // it now fires exactly once with fallback:true so every 200 fires the
+    // hook, and a consumer can tell "real image" from "placeholder" purely
+    // from the hook without inspecting response bytes.
     const onComplete = vi.fn();
     const onError = vi.fn();
     const app = express();
@@ -2830,9 +3427,59 @@ describe("onComplete observability hook (Task 6)", () => {
     expect(response.status).toBe(200);
     // onError fired with phase=sharp.
     expect(onError).toHaveBeenCalled();
-    // onComplete must NOT have been invoked — the success / 304 hook does
-    // not fire from the fallback catch branch.
-    expect(onComplete).not.toHaveBeenCalled();
+    // onComplete now fires exactly once from the hard-fallback catch branch.
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    const ctx = onComplete.mock.calls[0]![0] as {
+      cached: boolean;
+      outputBytes: number;
+      format: string;
+      durationMs: number;
+      fallback: boolean;
+    };
+    expect(ctx.fallback).toBe(true);
+    expect(ctx.cached).toBe(false);
+    // requestedType defaults to "normal" -> the bundled fallback is the
+    // pre-encoded JPEG asset, sent verbatim (no Sharp re-encode on this path).
+    expect(ctx.format).toBe("jpeg");
+    expect(ctx.outputBytes).toBe(response.body.length);
+    expect(ctx.outputBytes).toBeGreaterThan(0);
+    expect(ctx.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("fires with fallback:true and format:png on the outer hard-fallback path for an avatar request", async () => {
+    // Distinct fallbackType branch from the test above: an avatar-type
+    // request's hard fallback is the bundled PNG asset, not the normal-type
+    // JPEG — pins that `format`/`outputBytes` are derived from the actual
+    // bytes served on THIS branch, not copy-pasted from the normal case.
+    const onComplete = vi.fn();
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        onComplete,
+      }),
+    );
+
+    vi.spyOn(sharp.prototype, "toBuffer").mockRejectedValueOnce(
+      new Error("sharp blew up"),
+    );
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg", type: "avatar" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    const ctx = onComplete.mock.calls[0]![0] as {
+      format: string;
+      outputBytes: number;
+      fallback: boolean;
+    };
+    expect(ctx.fallback).toBe(true);
+    expect(ctx.format).toBe("png");
+    expect(ctx.outputBytes).toBe(response.body.length);
   });
 });
 
@@ -3124,5 +3771,546 @@ describe("getUserFolderRootDir lazy-create + cached realpath (Tasks 7, 8)", () =
     } finally {
       await fsmod.rm(rootDir, { recursive: true, force: true }).catch(() => {});
     }
+  });
+});
+
+describe("isInsideRoot preResolvedRoot parameter (Phase 6 Task 6.2 direct unit coverage)", () => {
+  it("trusts a supplied preResolvedRoot verbatim instead of re-resolving rootDir", async () => {
+    // Every existing isInsideRoot call in this file omits the third
+    // argument, so the `preResolvedRoot !== undefined` branch is only ever
+    // exercised indirectly through the middleware's own factory-level
+    // cache (see "realpath(rootDir) is invoked exactly once..." above).
+    // This test drives the exported parameter directly and proves the
+    // fast path genuinely SKIPS re-deriving rootDir's realpath — it uses
+    // whatever value the caller hands it, even when that value does not
+    // match `rootDir`'s own real location.
+    const fsmod = await import("node:fs/promises");
+    const osmod = await import("node:os");
+    const root = await fsmod.mkdtemp(
+      path.join(osmod.tmpdir(), "pixel-serve-preres-"),
+    );
+    const other = await fsmod.mkdtemp(
+      path.join(osmod.tmpdir(), "pixel-serve-preres-other-"),
+    );
+    try {
+      const child = path.join(root, "sub");
+      await fsmod.mkdir(child);
+
+      // Sanity baseline (no preResolvedRoot override): child is inside
+      // root and NOT inside other.
+      expect(await isInsideRoot(root, child)).toBe(true);
+      expect(await isInsideRoot(other, child)).toBe(false);
+
+      // Passing `other`'s realpath AS the preResolvedRoot for a call whose
+      // `rootDir` argument is `root` proves the function trusts the
+      // supplied value verbatim rather than re-deriving it from `rootDir`:
+      // `child` is not inside `other`, so this must now report false even
+      // though the `rootDir` argument is `root` (which DOES contain child).
+      const realOther = await fsmod.realpath(other);
+      expect(await isInsideRoot(root, child, realOther)).toBe(false);
+
+      // And the inverse sanity check: pre-resolving to root's OWN realpath
+      // keeps the expected true result — the fast path is behaviorally
+      // identical to the self-resolved path when given the correct value.
+      const realRoot = await fsmod.realpath(root);
+      expect(await isInsideRoot(root, child, realRoot)).toBe(true);
+      expect(await isInsideRoot(root, root, realRoot)).toBe(true);
+    } finally {
+      await fsmod.rm(root, { recursive: true, force: true });
+      await fsmod.rm(other, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("looksLikeSvg: DOCTYPE-prefixed SVG and entity-bomb detection", () => {
+  it("detects a plain <!DOCTYPE svg …> SVG with the root element inside the scan window", () => {
+    const buf = Buffer.from(
+      '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>',
+    );
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  it("detects a minimal <!DOCTYPE svg> with no external identifier", () => {
+    expect(looksLikeSvg(Buffer.from("<!DOCTYPE svg><svg></svg>"))).toBe(true);
+  });
+
+  it("does not false-positive on an unrelated DOCTYPE (e.g. html) even when the document mentions svg", () => {
+    const buf = Buffer.from(
+      "<!DOCTYPE html><html><body>renders an svg icon</body></html>",
+    );
+    expect(looksLikeSvg(buf)).toBe(false);
+  });
+
+  it("does not false-positive on a DOCTYPE root name that merely starts with 'svg' (prefix trap)", () => {
+    expect(looksLikeSvg(Buffer.from("<!DOCTYPE svgish><svgish/>"))).toBe(false);
+  });
+
+  it("detects a <!DOCTYPE svg [ <!ENTITY …> ]> billion-laughs bomb even when the <svg> root is pushed past the 4 KiB scan window", () => {
+    // Structurally a genuine nested-entity ("billion laughs") DOCTYPE — each
+    // entity references the previous one 3 times — but kept to a tiny depth
+    // / multiplier so a full expansion is only a few hundred bytes. This test
+    // must stay safe to run even if the fix under test has a bug and the
+    // buffer reaches a real XML/DTD parser; the actual DoS vector (an
+    // exponential-expansion bomb) is never exercised here, only sniffed.
+    // A separate, inert (non-recursive) filler entity pads the DOCTYPE's raw
+    // byte size well past the 4 KiB window without contributing to any
+    // expansion — this is what stands in for an attacker padding the
+    // internal subset with many real entity definitions.
+    const entities =
+      '<!ENTITY lol0 "lol">\n' +
+      '<!ENTITY lol1 "&lol0;&lol0;&lol0;">\n' +
+      '<!ENTITY lol2 "&lol1;&lol1;&lol1;">\n' +
+      `<!ENTITY filler "${"x".repeat(4500)}">\n`;
+    const buf = Buffer.from(
+      `<!DOCTYPE svg [\n${entities}]>\n<svg><text>&lol2;</text></svg>`,
+    );
+    expect(buf.length).toBeGreaterThan(4096);
+    // Confirm the root <svg> tag itself is genuinely outside the scanned
+    // window — otherwise this test would exercise the ordinary window scan
+    // added alongside it, not the entity-bomb-specific defense.
+    const svgTagIndex = buf.toString("latin1").indexOf("<svg>");
+    expect(svgTagIndex).toBeGreaterThan(4096);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  it("does not false-positive on a real raster (JPEG) fixture", async () => {
+    const jpegBytes = await FALLBACKIMAGES.normal();
+    expect(looksLikeSvg(jpegBytes)).toBe(false);
+  });
+
+  it("does not false-positive on plain text that merely contains the word svg without an SVG root or prolog", () => {
+    const buf = Buffer.from(
+      "This changelog entry documents svg handling improvements but is not markup at all.",
+    );
+    expect(looksLikeSvg(buf)).toBe(false);
+  });
+
+  it("rejects a DOCTYPE-bomb-shaped SVG buffer BEFORE Sharp ever parses it, when allowSvgInput is false (default)", async () => {
+    // End-to-end confirmation that the sniffer fix actually prevents the
+    // buffer from ever reaching Sharp/librsvg's DTD parser. This must NOT be
+    // asserted via response status/content-type alone: Sharp's own
+    // metadata-based `format === "svg"` guard (see "metadata-based Sharp
+    // guards" above) is a SEPARATE defense-in-depth layer that empirically
+    // also recognizes this exact buffer shape as SVG and rejects it with an
+    // identical 200/fallback/onError outcome — so a response-shape
+    // assertion alone would pass unchanged whether or not the Task 4.1 fix
+    // exists, making it vacuous. That second guard only fires AFTER Sharp's
+    // own parser has already processed the DTD far enough to identify the
+    // format — exactly the DTD-parsing exposure the sniff-level guard exists
+    // to avoid entirely. `sharp.prototype.metadata` is spied and asserted
+    // NEVER called (it is the package's only call site, confirmed via
+    // `grep -rn "\.metadata("` across src/) to prove the rejection happens
+    // at the sniff stage, before any Sharp instance is even asked to parse
+    // the buffer.
+    const entities =
+      '<!ENTITY lol0 "lol">\n' +
+      '<!ENTITY lol1 "&lol0;&lol0;&lol0;">\n' +
+      '<!ENTITY lol2 "&lol1;&lol1;&lol1;">\n' +
+      `<!ENTITY filler "${"x".repeat(4500)}">\n`;
+    const bombBuffer = Buffer.from(
+      `<!DOCTYPE svg [\n${entities}]>\n<svg><text>&lol2;</text></svg>`,
+    );
+
+    const tmpDir = path.join(assetDir, "..", "tmp-svg-doctype-bomb");
+    const fsmod = await import("node:fs/promises");
+    await fsmod.mkdir(tmpDir, { recursive: true });
+    const tmpFile = path.join(tmpDir, "bomb.svg");
+    await fsmod.writeFile(tmpFile, bombBuffer);
+
+    const metadataSpy = vi.spyOn(sharp.prototype, "metadata");
+    try {
+      const onError = vi.fn();
+      const app = express();
+      app.get(
+        "/api/v1/pixel/serve",
+        registerServe({ baseDir: tmpDir, onError }),
+      );
+      const response = await request(app)
+        .get("/api/v1/pixel/serve")
+        .query({ src: "bomb.svg", format: "jpeg" })
+        .parse(bufferParser);
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+      expect(metadataSpy).not.toHaveBeenCalled();
+      const rejectionErrors = onError.mock.calls.filter(
+        (c) => (c[1] as { phase: string }).phase === "sharp",
+      );
+      expect(rejectionErrors.length).toBeGreaterThan(0);
+      expect(
+        rejectionErrors.some((c) => (c[0] as Error).message.includes("svg")),
+      ).toBe(true);
+    } finally {
+      metadataSpy.mockRestore();
+      await fsmod.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects a UTF-16 LE BOM-prefixed billion-laughs DOCTYPE bomb pushed past the scan window", () => {
+    // Mirrors the latin1/UTF-8 entity-bomb case above but through the
+    // UTF-16 BOM branch, which has its own separate entity-bomb fallback.
+    const entities =
+      '<!ENTITY lol0 "lol">\n' +
+      '<!ENTITY lol1 "&lol0;&lol0;&lol0;">\n' +
+      `<!ENTITY filler "${"x".repeat(4500)}">\n`;
+    const text = `<!DOCTYPE svg [\n${entities}]>\n<svg><text>&lol1;</text></svg>`;
+    const utf16 = Buffer.alloc(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+      utf16.writeUInt16LE(text.charCodeAt(i), i * 2);
+    }
+    const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), utf16]);
+    // Confirm the root <svg> tag is genuinely outside the scanned window
+    // (start + 2-byte BOM + 4096 bytes of UTF-16 code units).
+    const svgTagIndex = text.indexOf("<svg>");
+    expect(svgTagIndex).toBeGreaterThan(2048);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  // The DOCTYPE-svg-root entity-bomb defense must also fire when the hostile
+  // DOCTYPE sits BEHIND an `<?xml …?>` declaration or `<!-- … -->` comment
+  // prolog — `<?xml version="1.0"?>` is in fact the most common real-world
+  // SVG opening. Before this was closed, only a bare-`<!doctype`-first head
+  // got the unconditional DOCTYPE fallback; a `<?xml`/comment-prefixed bomb
+  // DOCTYPE returned false and leaked the DTD to librsvg.
+  const bombEntities =
+    '<!ENTITY lol0 "lol">\n' +
+    '<!ENTITY lol1 "&lol0;&lol0;&lol0;">\n' +
+    '<!ENTITY lol2 "&lol1;&lol1;&lol1;">\n' +
+    `<!ENTITY filler "${"x".repeat(4500)}">\n`;
+
+  it("detects an <?xml …?>-prefixed <!DOCTYPE svg [entity-bomb]> even when the <svg> root is pushed past the 4 KiB window (latin1)", () => {
+    const buf = Buffer.from(
+      `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE svg [\n${bombEntities}]>\n<svg><text>&lol2;</text></svg>`,
+    );
+    expect(buf.length).toBeGreaterThan(4096);
+    // The literal <svg> tag must genuinely be outside the scanned window, so
+    // this exercises the DOCTYPE-root fallback and not the ordinary <svg scan.
+    const svgTagIndex = buf.toString("latin1").indexOf("<svg>");
+    expect(svgTagIndex).toBeGreaterThan(4096);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  it("detects a <!-- comment -->-prefixed <!DOCTYPE svg [entity-bomb]> pushed past the 4 KiB window (latin1)", () => {
+    const buf = Buffer.from(
+      `<!-- generated by design tool -->\n<!DOCTYPE svg [\n${bombEntities}]>\n<svg><text>&lol2;</text></svg>`,
+    );
+    expect(buf.length).toBeGreaterThan(4096);
+    const svgTagIndex = buf.toString("latin1").indexOf("<svg>");
+    expect(svgTagIndex).toBeGreaterThan(4096);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  it("detects a UTF-16 LE BOM + <?xml …?>-prefixed <!DOCTYPE svg [entity-bomb]> pushed past the scan window", () => {
+    const text = `<?xml version="1.0" encoding="UTF-16"?>\n<!DOCTYPE svg [\n${bombEntities}]>\n<svg><text>&lol2;</text></svg>`;
+    const utf16 = Buffer.alloc(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+      utf16.writeUInt16LE(text.charCodeAt(i), i * 2);
+    }
+    const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), utf16]);
+    const svgTagIndex = text.indexOf("<svg>");
+    expect(svgTagIndex).toBeGreaterThan(2048);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+
+  it("does not false-positive on an <?xml …?>-prefixed non-SVG DOCTYPE (e.g. html) even with an oversized DTD", () => {
+    // Same prolog+oversized-DTD shape as the bomb cases, but the DOCTYPE
+    // names `html`, not `svg`. The prolog-gated scan must NOT blanket-accept
+    // every prolog+DTD buffer — only ones whose DOCTYPE root is `svg` (or
+    // that carry an in-window `<svg` tag).
+    const buf = Buffer.from(
+      `<?xml version="1.0"?>\n<!DOCTYPE html [\n<!ENTITY filler "${"x".repeat(
+        4500,
+      )}">\n]>\n<html><body>an svg icon lives here</body></html>`,
+    );
+    expect(buf.length).toBeGreaterThan(4096);
+    expect(looksLikeSvg(buf)).toBe(false);
+  });
+
+  it("does not false-positive on an <?xml …?>-prefixed DOCTYPE whose root merely starts with 'svg' (prefix trap behind a prolog)", () => {
+    expect(
+      looksLikeSvg(
+        Buffer.from(
+          `<?xml version="1.0"?>\n<!DOCTYPE svgish [\n<!ENTITY filler "${"x".repeat(
+            4500,
+          )}">\n]>\n<svgish/>`,
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects an <?xml …?>-prefixed DOCTYPE-bomb SVG BEFORE Sharp ever parses it, when allowSvgInput is false (default)", async () => {
+    // End-to-end analogue of the bare-DOCTYPE metadata-spy test above, but
+    // for the `<?xml`-prefixed shape that previously leaked. Proves the fix
+    // stops the buffer at the sniff stage: sharp.prototype.metadata (the
+    // package's only .metadata() call site) is asserted NEVER invoked, so the
+    // hostile DTD never reaches librsvg's parser.
+    const bombBuffer = Buffer.from(
+      `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE svg [\n${bombEntities}]>\n<svg><text>&lol2;</text></svg>`,
+    );
+
+    const tmpDir = path.join(assetDir, "..", "tmp-svg-xml-doctype-bomb");
+    const fsmod = await import("node:fs/promises");
+    await fsmod.mkdir(tmpDir, { recursive: true });
+    const tmpFile = path.join(tmpDir, "xmlbomb.svg");
+    await fsmod.writeFile(tmpFile, bombBuffer);
+
+    const metadataSpy = vi.spyOn(sharp.prototype, "metadata");
+    try {
+      const onError = vi.fn();
+      const app = express();
+      app.get(
+        "/api/v1/pixel/serve",
+        registerServe({ baseDir: tmpDir, onError }),
+      );
+      const response = await request(app)
+        .get("/api/v1/pixel/serve")
+        .query({ src: "xmlbomb.svg", format: "jpeg" })
+        .parse(bufferParser);
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+      expect(metadataSpy).not.toHaveBeenCalled();
+      const rejectionErrors = onError.mock.calls.filter(
+        (c) => (c[1] as { phase: string }).phase === "sharp",
+      );
+      expect(rejectionErrors.length).toBeGreaterThan(0);
+      expect(
+        rejectionErrors.some((c) => (c[0] as Error).message.includes("svg")),
+      ).toBe(true);
+    } finally {
+      metadataSpy.mockRestore();
+      await fsmod.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not false-positive on a prolog-prefixed non-SVG document whose comment prose merely mentions the phrase <!doctype svg", () => {
+    // The DOCTYPE-svg-root check is anchored to a genuine top-level DOCTYPE
+    // token (reached by skipping the leading `<?xml …?>`/comment prolog), NOT
+    // an unanchored substring search over the whole window. A non-SVG
+    // document that merely *mentions* the characters `<!doctype svg` inside a
+    // comment must NOT be classified as SVG.
+    expect(
+      looksLikeSvg(
+        Buffer.from(
+          "<!-- this file demonstrates <!doctype svg usage in other docs -->\n<!DOCTYPE html><html><body>hi</body></html>",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      looksLikeSvg(
+        Buffer.from(
+          '<?xml version="1.0"?>\n<!-- see <!doctype svg for reference -->\n<!DOCTYPE root><root/>',
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("still detects a real <!DOCTYPE svg entity bomb that sits behind BOTH an <?xml declaration AND a comment", () => {
+    // The prolog skipper must strip an `<?xml …?>` declaration followed by one
+    // or more `<!-- … -->` comments (in that order) and still reach the
+    // genuine DOCTYPE, even though the DOCTYPE-root regex is anchored.
+    const entities =
+      '<!ENTITY lol0 "lol">\n' +
+      '<!ENTITY lol1 "&lol0;&lol0;&lol0;">\n' +
+      `<!ENTITY filler "${"x".repeat(4500)}">\n`;
+    const buf = Buffer.from(
+      `<?xml version="1.0"?>\n<!-- generated -->\n<!-- second comment -->\n<!DOCTYPE svg [\n${entities}]>\n<svg><text>&lol1;</text></svg>`,
+    );
+    expect(buf.length).toBeGreaterThan(4096);
+    const svgTagIndex = buf.toString("latin1").indexOf("<svg>");
+    expect(svgTagIndex).toBeGreaterThan(4096);
+    expect(looksLikeSvg(buf)).toBe(true);
+  });
+});
+
+describe("Phase 1 (server-fallback-cache): soft-fallback-aware Cache-Control + ETag", () => {
+  it("soft fallback (missing local file) is served with the short fallback Cache-Control, not the real-image default", async () => {
+    // Deliberately NOT createApp(): its configured cacheControl
+    // ("public, max-age=60") happens to equal the fallback policy, which
+    // would make a Cache-Control assertion pass whether or not the fix is
+    // actually implemented. A fresh app with no override makes the
+    // DEFAULT_CACHE_CONTROL ("public, max-age=86400,…") vs
+    // FALLBACK_CACHE_CONTROL ("public, max-age=60") distinction meaningful.
+    const app = express();
+    app.get("/api/v1/pixel/serve", registerServe({ baseDir: assetDir }));
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "missing-file.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["cache-control"]).toBe("public, max-age=60");
+    expect(response.headers.etag).toBeDefined();
+  });
+
+  it("soft fallback overrides even an operator-configured custom Cache-Control, not just an unset default", async () => {
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({ baseDir: assetDir, cacheControl: "private, no-cache" }),
+    );
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "missing-file.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    // The soft-fallback policy wins over the operator's own explicit,
+    // non-default configuration — proving the branch is keyed on
+    // servedSoftFallback, not merely "whatever the unset default would be."
+    expect(response.headers["cache-control"]).toBe("public, max-age=60");
+  });
+
+  it("soft fallback (blocked external host) is served with the short fallback Cache-Control and a buffer-hash ETag, not the pre-fetch url-keyed one", async () => {
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        allowedNetworkList: ["allowed.test"],
+      }),
+    );
+
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "https://blocked.test/image.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["cache-control"]).toBe("public, max-age=60");
+    const etag = response.headers.etag as string;
+    expect(etag).toBeDefined();
+
+    // "blocked.test" has a real deterministic identifier available BEFORE
+    // any fetch is attempted (buildSourceIdentifier returns `url:<src>`
+    // unconditionally for any external http(s) src). Prove the response
+    // ETag is instead the buffer-hash of the bytes actually sent — the same
+    // positive-proof technique the traversal-ETag test above uses.
+    const expectedBufferHashEtag = `"${createHash("sha256")
+      .update(response.body as Buffer)
+      .digest("hex")}"`;
+    expect(etag).toBe(expectedBufferHashEtag);
+  });
+
+  it("an external transient failure does not permanently 304-lock a client onto the placeholder — recovery after the ETag was captured returns 200 with the real image", async () => {
+    // First request: the allowed host is transiently unreachable. axios.get
+    // rejects, so fetchImage's onFallback marks this a soft fallback and the
+    // response ships the bundled placeholder with a buffer-hash ETag (proved
+    // by the tests above).
+    vi.mocked(axios.get).mockRejectedValueOnce(new Error("ECONNREFUSED"));
+
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({
+        baseDir: assetDir,
+        allowedNetworkList: ["allowed.test"],
+      }),
+    );
+
+    const query = { src: "https://allowed.test/down.jpg", format: "jpeg" };
+
+    const first = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query(query)
+      .parse(bufferParser);
+    expect(first.status).toBe(200);
+    expect(first.headers["cache-control"]).toBe("public, max-age=60");
+    const capturedEtag = first.headers.etag as string;
+    expect(capturedEtag).toBeDefined();
+
+    // Host "recovers": axios.get now resolves with a genuine, Sharp-decodable
+    // image, distinguishable from the JPEG placeholder by its pixel
+    // dimensions once decoded.
+    const recoveredImage = await sharp({
+      create: {
+        width: 40,
+        height: 40,
+        channels: 3,
+        background: { r: 10, g: 200, b: 10 },
+      },
+    })
+      .png()
+      .toBuffer();
+    vi.mocked(axios.get).mockResolvedValueOnce({
+      data: recoveredImage,
+      headers: { "content-type": mimeTypes.png },
+      status: 200,
+      statusText: "OK",
+      config: {},
+    });
+
+    // Present the ETag captured from the FIRST (placeholder) response.
+    // Pre-fix, that captured ETag would have been the stable, pre-fetch
+    // `url:<src>`-keyed deterministic ETag, and the pre-Sharp 304
+    // short-circuit would match it forever — permanently hiding the
+    // recovered real image behind a 304 even though the host is back up.
+    // Post-fix, the captured ETag is a buffer-hash of the placeholder bytes,
+    // which can never match the freshly-recomputed deterministic ETag, so
+    // the short-circuit misses, resolveBuffer() genuinely re-fetches, and
+    // the recovered image is served.
+    const second = await request(app)
+      .get("/api/v1/pixel/serve")
+      .set("If-None-Match", capturedEtag)
+      .query(query)
+      .parse(bufferParser);
+
+    expect(second.status).toBe(200);
+    expect(second.headers["content-type"]).toBe(mimeTypes.jpeg);
+    expect(second.headers["cache-control"]).toBe(
+      "public, max-age=86400, stale-while-revalidate=604800",
+    );
+
+    const firstMeta = await sharp(first.body as Buffer).metadata();
+    const secondMeta = await sharp(second.body as Buffer).metadata();
+    expect(secondMeta.width).toBe(40);
+    expect(secondMeta.height).toBe(40);
+    expect(
+      secondMeta.width === firstMeta.width &&
+        secondMeta.height === firstMeta.height,
+    ).toBe(false);
+  });
+});
+
+describe("Phase 3 (server-hardening): X-Content-Type-Options nosniff", () => {
+  it("genuine image response carries X-Content-Type-Options: nosniff", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("soft-fallback response (missing local file) carries X-Content-Type-Options: nosniff", async () => {
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "missing-file.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("hard-fallback response (Sharp throw, outer catch) carries X-Content-Type-Options: nosniff", async () => {
+    // Same forced-failure technique as "emits Vary: Accept-Encoding on the
+    // fallback path too" above: resolveBuffer() succeeds (a real local file),
+    // so servedSoftFallback is false, and the throw during Sharp encoding is
+    // only caught by the outer catch — the hard-fallback branch.
+    const app = createApp();
+    const toBufferSpy = vi
+      .spyOn(sharp.prototype, "toBuffer")
+      .mockRejectedValueOnce(new Error("forced sharp failure"));
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    toBufferSpy.mockRestore();
   });
 });

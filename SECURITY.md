@@ -76,7 +76,8 @@ be shortened — please flag this in the initial report.
 - The middleware factory `registerServe` and every exported helper
   (`isValidPath`, `isPublicHost`, `isPrivateIp`, `looksLikeSvg`,
   `buildDeterministicEtag`, `buildSourceIdentifier`, `buildFilename`,
-  `isInsideRoot`, `stripApiPrefix`, `resolvePinnedAddress`, `buildPinnedAgents`).
+  `isInsideRoot`, `resolveRootDir`, `stripApiPrefix`, `resolveInternalLocalPath`,
+  `resolvePinnedAddress`, `buildPinnedAgents`).
 - The Zod schemas (`optionsSchema`, `userDataSchema`) that gate user input.
 
 Common vulnerability classes that are explicitly in scope:
