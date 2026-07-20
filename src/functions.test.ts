@@ -14,6 +14,7 @@ import {
   readLocalImage,
   resolveInternalLocalPath,
   resolvePinnedAddress,
+  resolvePinnedAddresses,
   stripApiPrefix,
 } from "./functions";
 import { API_REGEX } from "./variables";
@@ -1878,6 +1879,159 @@ describe("allowedNetworkList case-insensitive matching (Task 2)", () => {
   });
 });
 
+describe("wildcard allowlist matching (*.domain)", () => {
+  // Regression coverage for the picsum.photos breakage: a host that
+  // 302-redirects to a CDN SUBDOMAIN (`picsum.photos` → `fastly.picsum.photos`)
+  // is rejected by an exact-match allowlist because the redirect hop is
+  // re-validated. A `*.picsum.photos` wildcard entry allows the apex and any
+  // subdomain, so the redirect resolves to the real image.
+
+  it("follows a redirect to a CDN subdomain when the wildcard entry allows it (picsum scenario)", async () => {
+    vi.mocked(axios.get)
+      .mockResolvedValueOnce({
+        data: Buffer.alloc(0),
+        headers: { location: "https://fastly.picsum.photos/id/1/800/600.jpg" },
+        status: 302,
+        statusText: "Found",
+        config: {},
+      })
+      .mockResolvedValueOnce({
+        data: Buffer.from("cdn-image"),
+        headers: { "content-type": "image/jpeg" },
+        status: 200,
+        statusText: "OK",
+        config: {},
+      });
+
+    const result = await fetchImage(
+      "https://picsum.photos/seed/net1/800/600",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["*.picsum.photos"],
+      { timeoutMs: 1000, maxBytes: 1024, maxRedirects: 3 },
+    );
+    expect(result.equals(Buffer.from("cdn-image"))).toBe(true);
+    expect(axios.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("still falls back on the same redirect when only the exact apex is allowlisted", async () => {
+    vi.mocked(axios.get).mockResolvedValueOnce({
+      data: Buffer.alloc(0),
+      headers: { location: "https://fastly.picsum.photos/id/1/800/600.jpg" },
+      status: 302,
+      statusText: "Found",
+      config: {},
+    });
+
+    const result = await fetchImage(
+      "https://picsum.photos/seed/net1/800/600",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["picsum.photos"], // exact — does NOT cover the fastly.* subdomain
+      { timeoutMs: 1000, maxBytes: 1024, maxRedirects: 3 },
+    );
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
+    expect(axios.get).toHaveBeenCalledTimes(1);
+  });
+
+  it("matches the apex host directly via a wildcard entry (no redirect)", async () => {
+    const data = Buffer.from("apex-image");
+    vi.mocked(axios.get).mockResolvedValue({
+      data,
+      headers: { "content-type": "image/jpeg" },
+      status: 200,
+      statusText: "OK",
+      config: {},
+    });
+    const result = await fetchImage(
+      "https://picsum.photos/x.jpg",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["*.picsum.photos"],
+      { timeoutMs: 1000, maxBytes: 1024 },
+    );
+    expect(result.equals(data)).toBe(true);
+  });
+
+  it("matches a deep subdomain via a wildcard entry", async () => {
+    const data = Buffer.from("deep-image");
+    vi.mocked(axios.get).mockResolvedValue({
+      data,
+      headers: { "content-type": "image/jpeg" },
+      status: 200,
+      statusText: "OK",
+      config: {},
+    });
+    const result = await fetchImage(
+      "https://a.b.picsum.photos/x.jpg",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["*.picsum.photos"],
+      { timeoutMs: 1000, maxBytes: 1024 },
+    );
+    expect(result.equals(data)).toBe(true);
+  });
+
+  it("rejects a sibling-label host that only textually resembles the wildcard suffix", async () => {
+    // `evilpicsum.photos` ends with "picsum.photos" but NOT ".picsum.photos",
+    // so the leading-dot suffix check must reject it (no bypass). axios must
+    // never be called — the host is rejected before any request.
+    const result = await fetchImage(
+      "https://evilpicsum.photos/x.jpg",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["*.picsum.photos"],
+      { timeoutMs: 1000, maxBytes: 1024 },
+    );
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unrelated host against a wildcard entry", async () => {
+    const result = await fetchImage(
+      "https://images.unsplash.com/x.jpg",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["*.picsum.photos"],
+      { timeoutMs: 1000, maxBytes: 1024 },
+    );
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a domain that merely contains the wildcard base as a subdomain", async () => {
+    // `picsum.photos.evil.com` must not match `*.picsum.photos` (the suffix
+    // ".picsum.photos" appears mid-string, not at the end).
+    const result = await fetchImage(
+      "https://picsum.photos.evil.com/x.jpg",
+      baseDir,
+      "localhost",
+      "normal",
+      /^\/api\/v1\//,
+      ["*.picsum.photos"],
+      { timeoutMs: 1000, maxBytes: 1024 },
+    );
+    const fallback = await FALLBACKIMAGES.normal();
+    expect(result.equals(fallback)).toBe(true);
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+});
+
 describe("DNS rebinding mitigation via pinned http(s) agents (Task 3)", () => {
   it("resolvePinnedAddress returns the validated address for a public hostname", async () => {
     setDnsLookup(async () => [{ address: "93.184.216.34", family: 4 }]);
@@ -1917,6 +2071,39 @@ describe("DNS rebinding mitigation via pinned http(s) agents (Task 3)", () => {
   it("resolvePinnedAddress returns family=6 for a public IPv6 literal", async () => {
     const pinned = await resolvePinnedAddress("2606:4700:4700::1111");
     expect(pinned).toEqual({ address: "2606:4700:4700::1111", family: 6 });
+    expect(dns.lookup).not.toHaveBeenCalled();
+  });
+
+  it("resolvePinnedAddresses returns EVERY validated address for a dual-stack host", async () => {
+    setDnsLookup(async () => [
+      { address: "2606:4700:4700::1111", family: 6 },
+      { address: "1.1.1.1", family: 4 },
+    ]);
+    const pinned = await resolvePinnedAddresses("dual.example");
+    expect(pinned).toEqual([
+      { address: "2606:4700:4700::1111", family: 6 },
+      { address: "1.1.1.1", family: 4 },
+    ]);
+  });
+
+  it("resolvePinnedAddresses returns null when ANY resolved address is private", async () => {
+    setDnsLookup(async () => [
+      { address: "93.184.216.34", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ]);
+    expect(await resolvePinnedAddresses("mixed.example")).toBeNull();
+  });
+
+  it("resolvePinnedAddresses returns null on lookup failure and for a private literal", async () => {
+    mockDnsFail();
+    expect(await resolvePinnedAddresses("nx.example")).toBeNull();
+    expect(await resolvePinnedAddresses("10.0.0.1")).toBeNull();
+  });
+
+  it("resolvePinnedAddresses returns a one-element list for a public IP literal (no DNS)", async () => {
+    expect(await resolvePinnedAddresses("8.8.8.8")).toEqual([
+      { address: "8.8.8.8", family: 4 },
+    ]);
     expect(dns.lookup).not.toHaveBeenCalled();
   });
 
@@ -2131,17 +2318,16 @@ describe("DNS rebinding mitigation via pinned http(s) agents (Task 3)", () => {
 describe("buildPinnedLookup dual callback shape (Task 1.1 — Node >=20 autoSelectFamily)", () => {
   it("answers both the {all:true} array shape and the legacy single-address shape", async () => {
     // Node's `net` module invokes an Agent's pinned `lookup` with the legacy
-    // single-address callback in most configurations, but switches to the
+    // single-address callback in some configurations, but switches to the
     // `{ all: true }` array-callback shape whenever `autoSelectFamily`
-    // applies and no `family` is pinned on the connect options (the default
-    // on Node >=20). `buildPinnedAgents` ALSO pins `family` +
-    // `autoSelectFamily: false` as defense in depth, which on this Node
-    // version makes the real net stack always choose the legacy shape (see
-    // the real-loopback tests below, which therefore only exercise that
-    // branch at runtime). This test drives the extracted `lookup` function
-    // directly with both option shapes so the `{ all: true }` array branch
-    // added in Task 1.1 is deterministically pinned regardless of which
-    // shape any particular Node version's internals choose to call.
+    // applies (the default on Node >=20). The agents no longer disable
+    // Happy-Eyeballs or pin a single `family`, so the real net stack may
+    // choose the `{ all: true }` shape at runtime (the real-loopback tests
+    // below therefore exercise it). This test drives the extracted `lookup`
+    // function directly with both option shapes so BOTH branches are
+    // deterministically pinned regardless of which shape any particular Node
+    // version's internals choose to call. A single pinned address surfaces as
+    // a one-element array on the `{ all: true }` shape.
     const { httpAgent } = buildPinnedAgents("93.184.216.34", 4);
     const agent = httpAgent as http.Agent & {
       options: { lookup?: unknown };
@@ -2187,7 +2373,12 @@ describe("buildPinnedLookup dual callback shape (Task 1.1 — Node >=20 autoSele
     expect(singleResult.family).toBe(4);
   });
 
-  it("pins family and disables autoSelectFamily on both agents (defense in depth)", () => {
+  it("leaves Happy-Eyeballs enabled and does not pin a single family on either agent", () => {
+    // The agents rely SOLELY on the pinned `lookup` for their SSRF boundary
+    // (the socket can only connect to a validated address the lookup returns).
+    // They deliberately do NOT set `autoSelectFamily: false` or a single
+    // `family`, so Node's default Happy-Eyeballs can fail over across the
+    // validated addresses instead of hanging on an unreachable first address.
     const { httpAgent, httpsAgent } = buildPinnedAgents(
       "2606:4700:4700::1111",
       6,
@@ -2202,10 +2393,54 @@ describe("buildPinnedLookup dual callback shape (Task 1.1 — Node >=20 autoSele
         options: { family?: number; autoSelectFamily?: boolean };
       }
     ).options;
-    expect(httpOpts.family).toBe(6);
-    expect(httpOpts.autoSelectFamily).toBe(false);
-    expect(httpsOpts.family).toBe(6);
-    expect(httpsOpts.autoSelectFamily).toBe(false);
+    expect(httpOpts.autoSelectFamily).toBeUndefined();
+    expect(httpOpts.family).toBeUndefined();
+    expect(httpsOpts.autoSelectFamily).toBeUndefined();
+    expect(httpsOpts.family).toBeUndefined();
+  });
+
+  it("pins all validated addresses so Happy-Eyeballs can fail over across them", async () => {
+    // A dual-stack host resolves to both an IPv6 and an IPv4 address. The
+    // pinned lookup must return BOTH on the `{ all: true }` shape (the shape
+    // Node uses when Happy-Eyeballs is active) so an unreachable first address
+    // no longer times out the whole fetch — this is the robustness fix.
+    const addresses: { address: string; family: 4 | 6 }[] = [
+      { address: "2606:4700:4700::1111", family: 6 },
+      { address: "1.1.1.1", family: 4 },
+    ];
+    const { httpAgent } = buildPinnedAgents(addresses);
+    const lookup = (httpAgent as http.Agent & { options: { lookup?: unknown } })
+      .options.lookup as
+      | ((
+          hostname: string,
+          options: { all?: boolean },
+          callback: (
+            err: NodeJS.ErrnoException | null,
+            address: string | LookupAddress[],
+            family?: number,
+          ) => void,
+        ) => void)
+      | undefined;
+    expect(typeof lookup).toBe("function");
+
+    const all: string | LookupAddress[] = await new Promise((resolve) =>
+      lookup!("evil.example", { all: true }, (_err, address) =>
+        resolve(address),
+      ),
+    );
+    expect(all).toEqual(addresses);
+
+    const single: {
+      address: string | LookupAddress[];
+      family?: number;
+    } = await new Promise((resolve) =>
+      lookup!("evil.example", {}, (_err, address, family) =>
+        resolve({ address, family }),
+      ),
+    );
+    // Legacy single-address shape still yields the FIRST validated address.
+    expect(single.address).toBe("2606:4700:4700::1111");
+    expect(single.family).toBe(6);
   });
 });
 

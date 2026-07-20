@@ -123,6 +123,66 @@ describe("registerServe middleware", () => {
     expect(response.body.length > 0).toBe(true);
   });
 
+  it("serves a genuine resized image for a sub-50 width (clamped to the default minWidth), not the hard fallback", async () => {
+    // Regression: a width below the OLD 50 floor used to throw in the schema
+    // and produce the hard-fallback placeholder (noimage.jpg served VERBATIM
+    // as image/jpeg). Now the [1,4000] floor lets it validate; renderUserData
+    // clamps it to the default minWidth (50), so the response is a genuinely
+    // Sharp-encoded 50x50 PNG. Both signals are non-vacuous: the hard fallback
+    // for a normal-type source would be image/JPEG (not the requested png) at
+    // noimage.jpg's NATIVE size — never a 50x50 png.
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", width: 32, height: 32, format: "png" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.png); // re-encoded, not verbatim jpeg
+    const meta = await sharp(response.body).metadata();
+    expect(meta.width).toBe(50);
+    expect(meta.height).toBe(50);
+  });
+
+  it("serves a true sub-50 image when the operator lowers minWidth/minHeight", async () => {
+    // With the framework floor at 1, an operator may configure minWidth/
+    // minHeight below 50 to serve genuine small images (32px avatars, icons).
+    const app = express();
+    app.get(
+      "/api/v1/pixel/serve",
+      registerServe({ baseDir: assetDir, minWidth: 16, minHeight: 16 }),
+    );
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", width: 32, height: 32, format: "png" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.png);
+    const meta = await sharp(response.body).metadata();
+    expect(meta.width).toBe(32);
+    expect(meta.height).toBe(32);
+  });
+
+  it("returns the hard fallback (verbatim placeholder) for an above-window width", async () => {
+    // The upper bound is unchanged: a width above 4000 is still rejected by
+    // the schema → hard fallback (the validation error throws before `type` is
+    // parsed, so the outer catch serves the normal-type placeholder). Proof is
+    // byte-equality with the raw bundled asset: the hard fallback serves it
+    // VERBATIM (no Sharp re-encode), a genuine resize would never be
+    // byte-identical, and width=4001 can only fall back — non-vacuous.
+    const app = createApp();
+    const response = await request(app)
+      .get("/api/v1/pixel/serve")
+      .query({ src: "noimage.jpg", width: 4001, format: "jpeg" })
+      .parse(bufferParser);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe(mimeTypes.jpeg);
+    const rawFallback = await fsp.readFile(path.join(assetDir, "noimage.jpg"));
+    expect(response.body.equals(rawFallback)).toBe(true);
+  });
+
   it("returns 304 when ETag matches, echoing ETag/Cache-Control/Vary per RFC 9110 §15.4.5", async () => {
     // Deliberately NOT createApp(): its configured cacheControl
     // ("public, max-age=60") is byte-identical to FALLBACK_CACHE_CONTROL, so

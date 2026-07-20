@@ -70,10 +70,20 @@ describe("userDataSchema", () => {
     expect(result.userId).toBe("12345");
   });
 
-  it("rejects width below minimum", () => {
-    expect(() => userDataSchema.parse({ width: 10 })).toThrow(
+  it("rejects width below the framework floor of 1", () => {
+    // The framework hard window is [1, 4000]. 0 and negatives are rejected;
+    // small positive sizes (see below) are now accepted so 32px/48px avatars
+    // and icons are servable — the floor was lowered from 50 to 1.
+    expect(() => userDataSchema.parse({ width: 0 })).toThrow("width too small");
+    expect(() => userDataSchema.parse({ width: -5 })).toThrow(
       "width too small",
     );
+  });
+
+  it("accepts small in-window widths (32, 48) that were previously rejected", () => {
+    expect(userDataSchema.parse({ width: 32 }).width).toBe(32);
+    expect(userDataSchema.parse({ width: 48 }).width).toBe(48);
+    expect(userDataSchema.parse({ width: 1 }).width).toBe(1);
   });
 
   it("rejects width above maximum", () => {
@@ -82,10 +92,18 @@ describe("userDataSchema", () => {
     );
   });
 
-  it("rejects height below minimum", () => {
-    expect(() => userDataSchema.parse({ height: 10 })).toThrow(
+  it("rejects height below the framework floor of 1", () => {
+    expect(() => userDataSchema.parse({ height: 0 })).toThrow(
       "height too small",
     );
+    expect(() => userDataSchema.parse({ height: -5 })).toThrow(
+      "height too small",
+    );
+  });
+
+  it("accepts small in-window heights (32, 48) that were previously rejected", () => {
+    expect(userDataSchema.parse({ height: 32 }).height).toBe(32);
+    expect(userDataSchema.parse({ height: 48 }).height).toBe(48);
   });
 
   it("rejects height above maximum", () => {
@@ -313,32 +331,43 @@ describe("optionsSchema", () => {
     expect(() =>
       optionsSchema.parse({ baseDir: "/images", maxWidth: 6000 }),
     ).toThrow(
-      /minWidth and maxWidth must lie within the framework's hard \[50, 4000\] dimension window/,
+      /maxWidth must lie within the framework's hard \[1, 4000\] dimension window/,
     );
   });
 
-  it("rejects minWidth below the framework's 50 floor", () => {
+  it("accepts minWidth below the old 50 floor (now permitted down to 1)", () => {
+    // The framework floor was lowered from 50 to 1, so an operator may now
+    // configure a small minWidth to serve true small images (32px avatars,
+    // 16px favicons). Values below 1 are still rejected by `.positive()`.
+    expect(
+      optionsSchema.parse({ baseDir: "/images", minWidth: 10 }).minWidth,
+    ).toBe(10);
+    expect(
+      optionsSchema.parse({ baseDir: "/images", minWidth: 1 }).minWidth,
+    ).toBe(1);
     expect(() =>
-      optionsSchema.parse({ baseDir: "/images", minWidth: 10 }),
-    ).toThrow(
-      /minWidth and maxWidth must lie within the framework's hard \[50, 4000\] dimension window/,
-    );
+      optionsSchema.parse({ baseDir: "/images", minWidth: 0 }),
+    ).toThrow();
+    expect(() =>
+      optionsSchema.parse({ baseDir: "/images", minWidth: -5 }),
+    ).toThrow();
   });
 
   it("rejects maxHeight above the framework's 4000 ceiling", () => {
     expect(() =>
       optionsSchema.parse({ baseDir: "/images", maxHeight: 5000 }),
     ).toThrow(
-      /minHeight and maxHeight must lie within the framework's hard \[50, 4000\] dimension window/,
+      /maxHeight must lie within the framework's hard \[1, 4000\] dimension window/,
     );
   });
 
-  it("rejects minHeight below the framework's 50 floor", () => {
+  it("accepts minHeight below the old 50 floor (now permitted down to 1)", () => {
+    expect(
+      optionsSchema.parse({ baseDir: "/images", minHeight: 10 }).minHeight,
+    ).toBe(10);
     expect(() =>
-      optionsSchema.parse({ baseDir: "/images", minHeight: 10 }),
-    ).toThrow(
-      /minHeight and maxHeight must lie within the framework's hard \[50, 4000\] dimension window/,
-    );
+      optionsSchema.parse({ baseDir: "/images", minHeight: 0 }),
+    ).toThrow();
   });
 
   it("accepts operator bounds at the exact [50, 4000] window edges", () => {
@@ -447,6 +476,78 @@ describe("allowedNetworkList entry validation (Task 9)", () => {
       "cdn.example.com",
       "images.test",
     ]);
+  });
+
+  it("accepts a well-formed wildcard entry and normalises it", () => {
+    const result = optionsSchema.parse({
+      baseDir: "/images",
+      allowedNetworkList: [" *.Picsum.Photos ", "images.unsplash.com"],
+    });
+    expect(result.allowedNetworkList).toEqual([
+      "*.picsum.photos",
+      "images.unsplash.com",
+    ]);
+  });
+
+  it("rejects a dangerously broad single-label wildcard (*.com)", () => {
+    expect(() =>
+      optionsSchema.parse({
+        baseDir: "/images",
+        allowedNetworkList: ["*.com"],
+      }),
+    ).toThrow(/at least two labels after '\*\.'/);
+  });
+
+  it("rejects a too-broad wildcard smuggled past the label count by an empty label", () => {
+    // A trailing root dot would otherwise split to ["com", ""] (length 2) and
+    // sneak past a naive count, then match every `*.com.` FQDN — the WHATWG
+    // URL parser preserves a trailing dot in `hostname`. Consecutive dots are
+    // the same trick from the other side.
+    expect(() =>
+      optionsSchema.parse({
+        baseDir: "/images",
+        allowedNetworkList: ["*.com."],
+      }),
+    ).toThrow(/at least two labels after '\*\.'/);
+    expect(() =>
+      optionsSchema.parse({
+        baseDir: "/images",
+        allowedNetworkList: ["*..com"],
+      }),
+    ).toThrow(/at least two labels after '\*\.'/);
+    // A genuine two-label base is still accepted with or without a root dot.
+    expect(
+      optionsSchema.parse({
+        baseDir: "/images",
+        allowedNetworkList: ["*.picsum.photos"],
+      }).allowedNetworkList,
+    ).toEqual(["*.picsum.photos"]);
+  });
+
+  it("rejects a bare '*' and a '*.' wildcard with no base", () => {
+    // "*" fails the hostname regex outright; "*." has an empty base and also
+    // fails the two-label refinement — either way it must not parse.
+    expect(() =>
+      optionsSchema.parse({ baseDir: "/images", allowedNetworkList: ["*"] }),
+    ).toThrow();
+    expect(() =>
+      optionsSchema.parse({ baseDir: "/images", allowedNetworkList: ["*."] }),
+    ).toThrow();
+  });
+
+  it("rejects a mid-string or trailing wildcard (only a leading '*.' is allowed)", () => {
+    expect(() =>
+      optionsSchema.parse({
+        baseDir: "/images",
+        allowedNetworkList: ["cdn.*.example.com"],
+      }),
+    ).toThrow(/allowedNetworkList entry is not a valid hostname/);
+    expect(() =>
+      optionsSchema.parse({
+        baseDir: "/images",
+        allowedNetworkList: ["example.*"],
+      }),
+    ).toThrow(/allowedNetworkList entry is not a valid hostname/);
   });
 });
 

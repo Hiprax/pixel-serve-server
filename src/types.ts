@@ -173,9 +173,31 @@ export type PixelServeOptions = {
    * Defaults to `undefined`, in which case `apiRegex` is used.
    */
   apiPrefix?: string;
+  /**
+   * Hosts allowed as remote image sources. Each entry is a hostname
+   * (`images.unsplash.com`) matched exactly, OR a wildcard of the form
+   * `*.example.com` which matches the apex (`example.com`) AND any subdomain
+   * (`cdn.example.com`, `a.b.example.com`). Use a wildcard for services that
+   * redirect to a CDN subdomain (e.g. `picsum.photos` → `fastly.picsum.photos`).
+   *
+   * A wildcard must have at least two labels after `*.` (so `*.com` is
+   * rejected at `registerServe()`), and public-suffix families (`*.co.uk`)
+   * are not special-cased. The wildcard relaxes only the hostname allowlist;
+   * every redirect hop is still re-validated against the DNS public-IP guard,
+   * so a wildcard can never reach a private/loopback/link-local address.
+   * Defaults to `[]` (no remote fetching).
+   */
   allowedNetworkList?: string[];
   cacheControl?: string;
   etag?: boolean;
+  /**
+   * Operator dimension bounds. Requested `width`/`height` are first validated
+   * against the framework's hard `[1, 4000]` window (out-of-window requests
+   * return a fallback image) and then clamped to these bounds. `minWidth`/
+   * `minHeight` may be set anywhere from 1 upward to serve small images
+   * (avatars, icons, favicons); `maxWidth`/`maxHeight` must not exceed 4000.
+   * Defaults: min 50, max 4000.
+   */
   minWidth?: number;
   maxWidth?: number;
   minHeight?: number;

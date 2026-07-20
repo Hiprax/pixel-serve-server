@@ -55,7 +55,14 @@ export const userDataSchema = z
         z
           .number()
           .int()
-          .min(50, "width too small")
+          // Framework hard window is [1, 4000]. A request inside the window is
+          // then clamped to the operator's minWidth/maxWidth by
+          // renderUserData; a request below 1 or above 4000 is rejected here
+          // (→ fallback image). The floor was lowered from 50 to 1 so common
+          // small sizes (32px/48px avatars, 16px favicons, thumbnails) are
+          // servable when the operator opts in with a low minWidth; the
+          // previous floor turned every sub-50px request into a placeholder.
+          .min(1, "width too small")
           .max(4000, "width too large")
           .optional(),
       ),
@@ -69,7 +76,7 @@ export const userDataSchema = z
         z
           .number()
           .int()
-          .min(50, "height too small")
+          .min(1, "height too small")
           .max(4000, "height too large")
           .optional(),
       ),
@@ -151,26 +158,48 @@ export const optionsSchema = z
             z
               .string()
               .min(1, "allowedNetworkList entries cannot be empty")
-              // Hostnames only: letters, digits, dots, hyphens. Rejects
-              // whitespace-only entries (after trim → empty → caught by
-              // `.min(1)`) and any entry containing path/protocol/internal-
-              // whitespace characters. Defence in depth — the Task 2
-              // lowercase transform below already collapses an empty entry
-              // into `""` which would silently match
-              // `url.hostname === ""` for inputs like `http:///path`. The
-              // regex is intentionally permissive (no FQDN structure
-              // enforcement) so single-label hosts and IDN-encoded punycode
-              // labels still parse.
+              // Hostnames only, with an OPTIONAL leading `*.` wildcard.
+              // Letters, digits, dots, hyphens for the host part; a single
+              // `*.` prefix opts the entry into subdomain matching (see
+              // `isHostAllowed` in functions.ts — the wildcard matches the
+              // apex AND any subdomain). Rejects whitespace-only entries
+              // (after trim → empty → caught by `.min(1)`) and any entry
+              // containing path/protocol/internal-whitespace characters. The
+              // regex is intentionally permissive on the host part (no FQDN
+              // structure enforcement) so single-label hosts and IDN-encoded
+              // punycode labels still parse.
               .regex(
-                /^[a-z0-9.-]+$/i,
+                /^(\*\.)?[a-z0-9.-]+$/i,
                 "allowedNetworkList entry is not a valid hostname",
+              )
+              // Footgun guard: a wildcard entry must carry at least two
+              // NON-EMPTY labels after `*.` (e.g. `*.picsum.photos`), so an
+              // overly broad `*.com` / `*.` / `*` can never be configured.
+              // Empty labels are filtered before counting so a trailing or
+              // doubled dot cannot smuggle a too-broad entry past the count:
+              // `*.com.` would otherwise split to ["com", ""] (length 2) and
+              // be accepted, then match every `*.com.` FQDN — the WHATWG URL
+              // parser preserves a trailing root dot in `hostname`. Note the
+              // wildcard relaxes only the HOSTNAME check; the per-hop DNS
+              // public-IP guard still runs on every redirect, so a wildcard
+              // can never open an SSRF path to a private IP. Public-suffix
+              // families (`*.co.uk`) are not special-cased — an operator that
+              // lists such an entry accepts every host under it.
+              .refine(
+                (entry) =>
+                  !entry.startsWith("*.") ||
+                  entry.slice(2).split(".").filter(Boolean).length >= 2,
+                {
+                  message:
+                    "wildcard allowedNetworkList entry must have at least two labels after '*.' (e.g. *.example.com)",
+                },
               ),
           ),
       )
-      // Task 2 contract: also lowercase so case-mismatched config still
-      // matches the WHATWG-URL-lowercased `url.hostname`. The trim above
-      // happens per-entry inside the inner schema; this transform finishes
-      // the normalisation.
+      // Also lowercase so case-mismatched config still matches the WHATWG-URL-
+      // lowercased `url.hostname`. The trim above happens per-entry inside the
+      // inner schema; this transform finishes the normalisation. The `*.`
+      // prefix is unaffected by lowercasing.
       .transform((arr) => arr.map((host) => host.toLowerCase()))
       .default([]),
     cacheControl: z.string().optional(),
@@ -210,21 +239,23 @@ export const optionsSchema = z
     message: "minHeight must be less than or equal to maxHeight",
     path: ["minHeight"],
   })
-  // userDataSchema hard-rejects any request width/height outside [50, 4000]
-  // (see below) before renderUserData's clamp() ever runs, so an operator
-  // minWidth/maxWidth/minHeight/maxHeight configured outside that window is
-  // silently non-functional for the out-of-window portion of its range —
-  // e.g. minWidth: 10 can never rescue a width:20 request, since the schema
-  // throws "width too small" first. Fail loudly at registerServe() time
-  // instead of shipping a config that quietly does nothing.
-  .refine((data) => data.minWidth >= 50 && data.maxWidth <= 4000, {
+  // userDataSchema hard-rejects any request width/height outside [1, 4000]
+  // (see above) before renderUserData's clamp() ever runs, so an operator
+  // maxWidth/maxHeight configured above 4000 is silently non-functional for
+  // the out-of-window portion of its range — e.g. maxWidth: 5000 can never
+  // satisfy a width:4500 request, since the schema throws "width too large"
+  // first. Fail loudly at registerServe() time instead of shipping a config
+  // that quietly does nothing. The lower bound needs no refinement: minWidth/
+  // minHeight are already `.positive()` (>= 1), which is exactly the window
+  // floor, so any valid config is representable.
+  .refine((data) => data.maxWidth <= 4000, {
     message:
-      "minWidth and maxWidth must lie within the framework's hard [50, 4000] dimension window",
+      "maxWidth must lie within the framework's hard [1, 4000] dimension window",
     path: ["maxWidth"],
   })
-  .refine((data) => data.minHeight >= 50 && data.maxHeight <= 4000, {
+  .refine((data) => data.maxHeight <= 4000, {
     message:
-      "minHeight and maxHeight must lie within the framework's hard [50, 4000] dimension window",
+      "maxHeight must lie within the framework's hard [1, 4000] dimension window",
     path: ["maxHeight"],
   });
 
