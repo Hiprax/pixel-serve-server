@@ -11,6 +11,7 @@ export {
   isPrivateIp,
   isPublicHost,
   resolvePinnedAddress,
+  resolvePinnedAddresses,
   buildPinnedAgents,
   stripApiPrefix,
   resolveInternalLocalPath,

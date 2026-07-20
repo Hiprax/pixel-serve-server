@@ -339,41 +339,61 @@ export const isPublicHost = async (hostname: string): Promise<boolean> => {
   }
 };
 
+/** A validated, connectable address pinned into an agent's `lookup`. */
+type PinnedAddress = { address: string; family: 4 | 6 };
+
 /**
- * Resolves a hostname once, validates every returned address is public, and
- * returns a `{ address, family }` pair that can be pinned to an
- * `http.Agent`/`https.Agent`'s `lookup` function. The same address is then
- * guaranteed to be the one the TCP socket connects to, closing the DNS-
+ * Resolves a hostname once, validates that EVERY returned address is public,
+ * and returns the full list of `{ address, family }` pairs. The list is then
+ * pinned into an `http.Agent`/`https.Agent`'s `lookup` function so the TCP
+ * socket can only connect to an address we validated — closing the DNS-
  * rebinding window between the validation lookup and axios' subsequent
- * resolve. For IP literals the input is returned verbatim (still subject to
- * `isPrivateIp`) and no DNS lookup is performed.
+ * resolve. Returning ALL validated addresses (rather than just the first)
+ * lets Node's Happy-Eyeballs (`autoSelectFamily`, on by default since Node
+ * 20) fail over across families/addresses, so a host whose first-returned
+ * address is an unreachable IPv6 no longer times out the whole fetch. For IP
+ * literals the input is returned verbatim (still subject to `isPrivateIp`)
+ * and no DNS lookup is performed.
  *
- * Returns `null` when the host is empty, the host resolves to no addresses,
- * the host resolves to (or is) a private/loopback/link-local IP, or DNS
- * resolution fails. Callers fall back to the regular failure path on `null`.
+ * Returns `null` when the host is empty, resolves to no addresses, resolves
+ * to (or is) a private/loopback/link-local IP (conservatively: if ANY
+ * resolved address is private the whole host is rejected), or DNS resolution
+ * fails. Callers fall back to the regular failure path on `null`.
  */
-export const resolvePinnedAddress = async (
+export const resolvePinnedAddresses = async (
   hostname: string,
-): Promise<{ address: string; family: 4 | 6 } | null> => {
+): Promise<PinnedAddress[] | null> => {
   if (!hostname) return null;
   const stripped = hostname.replace(/^\[|\]$/g, "");
   if (isIP(stripped) !== 0) {
     if (isPrivateIp(stripped)) return null;
     const family = isIP(stripped) === 6 ? 6 : 4;
-    return { address: stripped, family };
+    return [{ address: stripped, family }];
   }
   try {
     const addresses = await dns.lookup(stripped, { all: true, verbatim: true });
     if (!addresses.length) return null;
     if (addresses.some((a) => isPrivateIp(a.address))) return null;
-    const first = addresses[0]!;
-    return {
-      address: first.address,
-      family: first.family === 6 ? 6 : 4,
-    };
+    return addresses.map((a) => ({
+      address: a.address,
+      family: a.family === 6 ? 6 : 4,
+    }));
   } catch {
     return null;
   }
+};
+
+/**
+ * Backward-compatible single-address resolver: returns the FIRST validated
+ * `{ address, family }` pair (or `null`). Retained because it is part of the
+ * package's exported surface; prefer `resolvePinnedAddresses` internally so
+ * Happy-Eyeballs can fail over across every validated address.
+ */
+export const resolvePinnedAddress = async (
+  hostname: string,
+): Promise<PinnedAddress | null> => {
+  const addresses = await resolvePinnedAddresses(hostname);
+  return addresses ? addresses[0]! : null;
 };
 
 /**
@@ -391,56 +411,98 @@ type PinnedLookup = LookupFunction;
 
 /**
  * Builds a pinned `lookup` function that always resolves to the same
- * `{ address, family }` pair. Used by `buildPinnedAgents` to force axios to
- * connect to the pre-validated IP rather than re-resolving the hostname.
+ * pre-validated address list. Used by `buildPinnedAgents` to force axios to
+ * connect only to IPs we validated rather than re-resolving the hostname.
  *
  * Handles both calling conventions Node uses for an Agent's pinned `lookup`:
- * the `{ all: true }` shape (the default on Node >=20, since
- * `net.getDefaultAutoSelectFamily()` is `true` and no `family` is pinned on
- * the connect options) expects `callback(err, [{ address, family }])`; the
- * legacy single-address `callback(err, address, family)` form is used
- * otherwise. Without this, `net` receives `undefined` from the single-address
- * form and the socket connect throws `ERR_INVALID_IP_ADDRESS`.
+ * the `{ all: true }` shape (the default on Node >=20 when Happy-Eyeballs is
+ * active) expects `callback(err, [{ address, family }, …])`; the legacy
+ * single-address `callback(err, address, family)` form is used otherwise (it
+ * receives the first validated address). Without the array branch, `net`
+ * receives `undefined` from the single-address form and the socket connect
+ * throws `ERR_INVALID_IP_ADDRESS`.
  */
 const buildPinnedLookup =
-  (address: string, family: 4 | 6): PinnedLookup =>
+  (addresses: PinnedAddress[]): PinnedLookup =>
   (_hostname, options, callback): void => {
     if (options?.all) {
-      callback(null, [{ address, family }]);
+      callback(null, addresses);
     } else {
-      callback(null, address, family);
+      const first = addresses[0]!;
+      callback(null, first.address, first.family);
     }
   };
 
 /**
  * Builds `httpAgent` and `httpsAgent` instances whose internal `lookup`
- * function is pinned to a single `{ address, family }` pair. Passed to axios
- * via the per-request config so the kernel resolver is never consulted again
- * after our `isPublicHost` validation. Mitigates the classic DNS-rebinding
- * exploit where an attacker-controlled authoritative server answers the
- * validation lookup with a public IP and the subsequent connect-time lookup
- * with `127.0.0.1`/`169.254.169.254`/etc.
+ * function is pinned to a pre-validated address list. Passed to axios via the
+ * per-request config so the kernel resolver is never consulted again after
+ * our public-IP validation. Mitigates the classic DNS-rebinding exploit where
+ * an attacker-controlled authoritative server answers the validation lookup
+ * with a public IP and the subsequent connect-time lookup with
+ * `127.0.0.1`/`169.254.169.254`/etc.
  *
  * Each call returns a new pair of agents (one per request); the agents are
  * not reused across requests so the pinning lifetime matches the redirect
- * loop hop that validated the IP. Agents are not explicitly `destroy()`-ed
+ * loop hop that validated the IPs. Agents are not explicitly `destroy()`-ed
  * because Node garbage-collects unused agents once their sockets close.
  *
- * `family` and `autoSelectFamily: false` are also passed directly to both
- * agents as defense in depth: even if a future Node change alters how/when
- * `lookup` is invoked, pinning `family` and disabling Happy Eyeballs
- * (`autoSelectFamily`) keeps the socket connect from second-guessing the
- * validated address.
+ * The agents deliberately do NOT set `autoSelectFamily: false` or pin a single
+ * `family`: leaving Node's default Happy-Eyeballs enabled lets the socket
+ * connect fail over across the validated addresses (e.g. try IPv4 when the
+ * first-returned IPv6 is unreachable) instead of hanging until timeout. This
+ * does not weaken the SSRF boundary — the socket can still only connect to an
+ * address the pinned `lookup` returns, and every one of those was validated
+ * public by `resolvePinnedAddresses`.
+ *
+ * Accepts either the legacy `(address, family)` pair (backward-compatible with
+ * external callers) or a pre-validated `PinnedAddress[]` list.
  */
-export const buildPinnedAgents = (
+export function buildPinnedAgents(
   address: string,
   family: 4 | 6,
-): { httpAgent: http.Agent; httpsAgent: https.Agent } => {
-  const lookup = buildPinnedLookup(address, family);
+): { httpAgent: http.Agent; httpsAgent: https.Agent };
+export function buildPinnedAgents(addresses: PinnedAddress[]): {
+  httpAgent: http.Agent;
+  httpsAgent: https.Agent;
+};
+export function buildPinnedAgents(
+  addressOrList: string | PinnedAddress[],
+  family?: 4 | 6,
+): { httpAgent: http.Agent; httpsAgent: https.Agent } {
+  const addresses: PinnedAddress[] = Array.isArray(addressOrList)
+    ? addressOrList
+    : [{ address: addressOrList, family: family as 4 | 6 }];
+  const lookup = buildPinnedLookup(addresses);
   return {
-    httpAgent: new http.Agent({ lookup, family, autoSelectFamily: false }),
-    httpsAgent: new https.Agent({ lookup, family, autoSelectFamily: false }),
+    httpAgent: new http.Agent({ lookup }),
+    httpsAgent: new https.Agent({ lookup }),
   };
+}
+
+/**
+ * Tests one candidate host string against one allowlist entry.
+ *
+ * - An exact entry (`picsum.photos`) matches only that host verbatim —
+ *   identical to the previous exact-match behavior, so existing configs are
+ *   unaffected.
+ * - A wildcard entry (`*.picsum.photos`) matches the apex (`picsum.photos`)
+ *   AND any subdomain (`fastly.picsum.photos`, `i.picsum.photos`, …). The
+ *   leading dot in the suffix check (`.picsum.photos`) is load-bearing: it
+ *   prevents a sibling-label bypass such as `evilpicsum.photos`, which does
+ *   NOT end with `.picsum.photos`.
+ *
+ * SECURITY: a wildcard relaxes only the hostname allowlist. Every redirect
+ * hop is still independently re-validated against the DNS public-IP guard
+ * (`resolvePinnedAddresses` → `isPrivateIp`), so a wildcard can never open an
+ * SSRF path to a private/loopback/link-local address.
+ */
+const hostMatchesEntry = (host: string, entry: string): boolean => {
+  if (entry.startsWith("*.")) {
+    const suffix = entry.slice(1); // "*.picsum.photos" → ".picsum.photos"
+    return host === entry.slice(2) || host.endsWith(suffix);
+  }
+  return host === entry;
 };
 
 const isHostAllowed = (
@@ -448,7 +510,10 @@ const isHostAllowed = (
   host: string,
   allowedNetworkList: string[],
 ): boolean =>
-  allowedNetworkList.includes(hostname) || allowedNetworkList.includes(host);
+  allowedNetworkList.some(
+    (entry) =>
+      hostMatchesEntry(hostname, entry) || hostMatchesEntry(host, entry),
+  );
 
 /**
  * Issues a single (non-redirecting) GET request and returns the axios response
@@ -562,13 +627,15 @@ const fetchFromNetwork = async (
         );
         return await fallback();
       }
-      // Resolve once and pin the address into the http(s) agent's `lookup`
-      // function so axios connects to the IP we validated, NOT whatever the
-      // kernel resolver answers microseconds later. This closes the classic
-      // DNS-rebinding TOCTOU window across the manual redirect loop. The
-      // pinned-address helper also runs the `isPrivateIp` validation, so a
-      // separate `isPublicHost` call is redundant here.
-      const pinned = await resolvePinnedAddress(parsed.hostname);
+      // Resolve once and pin the validated addresses into the http(s) agent's
+      // `lookup` function so axios connects only to IPs we validated, NOT
+      // whatever the kernel resolver answers microseconds later. This closes
+      // the classic DNS-rebinding TOCTOU window across the manual redirect
+      // loop. The pinned-address helper also runs the `isPrivateIp`
+      // validation, so a separate `isPublicHost` call is redundant here.
+      // Pinning ALL validated addresses lets Happy-Eyeballs fail over across
+      // families instead of hanging on an unreachable first address.
+      const pinned = await resolvePinnedAddresses(parsed.hostname);
       if (!pinned) {
         safeOnError(
           onError,
@@ -581,7 +648,7 @@ const fetchFromNetwork = async (
         return await fallback();
       }
 
-      const agents = buildPinnedAgents(pinned.address, pinned.family);
+      const agents = buildPinnedAgents(pinned);
       const response = await requestNoRedirect(
         currentUrl,
         timeoutMs,
