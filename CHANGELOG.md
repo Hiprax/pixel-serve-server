@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-07-20
+
 ### Added
 
 - **Support wildcard `*.domain` entries in `allowedNetworkList`.** An exact-match-only allowlist could not express "this domain and the CDN it redirects to", which silently broke every image served by a host that 302s to a CDN subdomain. `picsum.photos`, for example, redirects to `fastly.picsum.photos`; because the SSRF redirect loop re-validates every hop against the allowlist (correctly), the CDN hop was rejected and each request fell back to a placeholder. An entry may now take the form `*.example.com`, which matches the apex (`example.com`) **and** any subdomain (`cdn.example.com`, `a.b.example.com`). Matching uses a leading-dot suffix test, so a sibling-label host (`evilexample.com`) and a mid-string host (`example.com.evil.net`) are both rejected — there is no suffix-confusion bypass. A wildcard must carry at least two non-empty labels after `*.`, so an overly broad `*.com` (or `*.com.`/`*..com`, which an empty label would otherwise smuggle past the count) is rejected at `registerServe()`; public-suffix families such as `*.co.uk` are deliberately not special-cased, and an operator listing one accepts every host beneath it. **Security note:** a wildcard relaxes only the hostname allowlist. Every redirect hop is still independently re-validated against the http/https protocol guard and the DNS public-IP check, so a wildcard can never open an SSRF path to a private, loopback, or link-local address. Exact entries are matched exactly, as before, so existing configurations are unaffected. (`src/schema.ts`, `src/functions.ts`, `src/types.ts`)
